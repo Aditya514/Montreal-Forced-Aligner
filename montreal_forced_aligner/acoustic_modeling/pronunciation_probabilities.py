@@ -1,30 +1,23 @@
 """Class definitions for PronunciationProbabilityTrainer"""
 import json
-import logging
+import multiprocessing as mp
 import os
-import re
 import shutil
 import time
 import typing
-from pathlib import Path
+from queue import Empty
 
+import tqdm
 from sqlalchemy.orm import joinedload
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner.acoustic_modeling.base import AcousticModelTrainingMixin
-from montreal_forced_aligner.alignment.multiprocessing import (
-    GeneratePronunciationsArguments,
-    GeneratePronunciationsFunction,
-)
-from montreal_forced_aligner.config import GLOBAL_CONFIG
-from montreal_forced_aligner.db import CorpusWorkflow, Dictionary, Pronunciation, Utterance, Word
+from montreal_forced_aligner.alignment.multiprocessing import GeneratePronunciationsFunction
+from montreal_forced_aligner.db import Dictionary, Pronunciation, Utterance, Word
 from montreal_forced_aligner.g2p.trainer import PyniniTrainerMixin
 from montreal_forced_aligner.helper import mfa_open
-from montreal_forced_aligner.utils import parse_dictionary_file, run_kaldi_function
+from montreal_forced_aligner.utils import KaldiProcessWorker, Stopped
 
 __all__ = ["PronunciationProbabilityTrainer"]
-
-logger = logging.getLogger("mfa")
 
 
 class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerMixin):
@@ -73,84 +66,65 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
         pass
 
     @property
-    def exported_model_path(self) -> Path:
+    def exported_model_path(self) -> str:
         """Path to exported acoustic model"""
         return self.previous_trainer.exported_model_path
 
     @property
-    def model_path(self) -> Path:
+    def model_path(self) -> str:
         """Current acoustic model path"""
-        return self.working_directory.joinpath("final.mdl")
+        return os.path.join(self.working_directory, "final.mdl")
 
     @property
-    def alignment_model_path(self) -> Path:
+    def alignment_model_path(self) -> str:
         """Alignment model path"""
-        path = self.model_path.with_suffix(".alimdl")
+        path = self.model_path.replace(".mdl", ".alimdl")
         if os.path.exists(path):
             return path
         return self.model_path
 
     @property
-    def phone_symbol_table_path(self) -> Path:
+    def working_directory(self) -> str:
+        """Training directory"""
+        if self.pronunciations_complete:
+            return super(PronunciationProbabilityTrainer, self).working_directory
+        return self.previous_aligner.working_directory
+
+    @property
+    def num_jobs(self) -> int:
+        """Number of jobs from the root worker"""
+        return self.worker.num_jobs
+
+    @property
+    def phone_symbol_table_path(self) -> str:
         """Worker's phone symbol table"""
         return self.worker.phone_symbol_table_path
 
     @property
-    def grapheme_symbol_table_path(self) -> Path:
+    def grapheme_symbol_table_path(self) -> str:
         """Worker's grapheme symbol table"""
         return self.worker.grapheme_symbol_table_path
 
     @property
-    def input_path(self) -> Path:
+    def input_path(self) -> str:
         """Path to temporary file to store training data"""
-        return self.working_directory.joinpath(f"input_{self._data_source}.txt")
+        return os.path.join(self.working_directory, f"input_{self._data_source}.txt")
 
     @property
-    def output_path(self) -> Path:
+    def output_path(self) -> str:
         """Path to temporary file to store training data"""
-        return self.working_directory.joinpath(f"output_{self._data_source}.txt")
-
-    @property
-    def output_alignment_path(self) -> Path:
-        """Path to temporary file to store training data"""
-        return self.working_directory.joinpath(f"output_{self._data_source}_alignment.txt")
-
-    def generate_pronunciations_arguments(self) -> typing.List[GeneratePronunciationsArguments]:
-        """
-        Generate Job arguments for :func:`~montreal_forced_aligner.alignment.multiprocessing.GeneratePronunciationsFunction`
-
-        Returns
-        -------
-        list[:class:`~montreal_forced_aligner.alignment.multiprocessing.GeneratePronunciationsArguments`]
-            Arguments for processing
-        """
-
-        return [
-            GeneratePronunciationsArguments(
-                j.id,
-                getattr(self, "db_string", ""),
-                self.working_log_directory.joinpath(f"generate_pronunciations.{j.id}.log"),
-                self.model_path,
-                True,
-            )
-            for j in self.jobs
-        ]
-
-    def align_g2p(self, output_path=None) -> None:
-        """Runs the entire alignment regimen."""
-        self._lexicon_covering(output_path=output_path)
-        self._alignments()
-        self._encode()
+        return os.path.join(self.working_directory, f"output_{self._data_source}.txt")
 
     def train_g2p_lexicon(self) -> None:
         """Generate a G2P lexicon based on aligned transcripts"""
-        arguments = self.generate_pronunciations_arguments()
+        arguments = self.worker.generate_pronunciations_arguments()
         working_dir = super(PronunciationProbabilityTrainer, self).working_directory
         texts = {}
         with self.worker.session() as session:
             query = session.query(Utterance.id, Utterance.normalized_character_text)
             query = query.filter(Utterance.ignored == False)  # noqa
-            # query = query.filter(Utterance.oovs != '', Utterance.oovs != None)
+            initial_brackets = "".join(x[0] for x in self.worker.brackets)
+            query = query.filter(~Utterance.oovs.regexp_match(f"(^| )[^{initial_brackets}]"))
             if self.subset:
                 query = query.filter_by(in_subset=True)
             for utt_id, text in query:
@@ -175,101 +149,98 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                 )
                 for x in self.worker.dictionary_lookup.values()
             }
-            output_alignment_files = {
-                x: open(
-                    os.path.join(
-                        working_dir, f"output_{self.worker.dictionary_base_names[x]}_alignment.txt"
-                    ),
-                    "w",
-                    encoding="utf8",
-                    newline="",
-                )
-                for x in self.worker.dictionary_lookup.values()
-            }
-            with tqdm(total=self.num_current_utterances, disable=GLOBAL_CONFIG.quiet) as pbar:
-                for dict_id, utt_id, phones in run_kaldi_function(
-                    GeneratePronunciationsFunction, arguments, pbar.update
-                ):
-                    if utt_id not in texts or not texts[utt_id]:
-                        continue
+            with tqdm.tqdm(
+                total=self.num_current_utterances, disable=getattr(self, "quiet", False)
+            ) as pbar:
+                if self.use_mp:
+                    error_dict = {}
+                    return_queue = mp.Queue()
+                    stopped = Stopped()
+                    procs = []
+                    for i, args in enumerate(arguments):
+                        args.for_g2p = True
+                        function = GeneratePronunciationsFunction(args)
+                        p = KaldiProcessWorker(i, return_queue, function, stopped)
+                        procs.append(p)
+                        p.start()
+                    while True:
+                        try:
+                            result = return_queue.get(timeout=1)
+                            if isinstance(result, Exception):
+                                error_dict[getattr(result, "job_name", 0)] = result
+                                continue
+                            if stopped.stop_check():
+                                continue
+                        except Empty:
+                            for proc in procs:
+                                if not proc.finished.stop_check():
+                                    break
+                            else:
+                                break
+                            continue
+                        dict_id, utt_id, phones = result
+                        utt_id = int(utt_id.split("-")[-1])
+                        pbar.update(1)
+                        if utt_id not in texts or not texts[utt_id]:
+                            continue
 
-                    print(phones, file=output_alignment_files[dict_id])
-                    print(
-                        re.sub(r"\s+", " ", phones.replace("#1", "").replace("#2", "")).strip(),
-                        file=output_files[dict_id],
-                    )
-                    print(texts[utt_id], file=input_files[dict_id])
+                        print(phones, file=output_files[dict_id])
+                        print(f"<s> {texts[utt_id]} </s>", file=input_files[dict_id])
+
+                    for p in procs:
+                        p.join()
+                    if error_dict:
+                        for v in error_dict.values():
+                            raise v
+                else:
+                    self.log_debug("Not using multiprocessing...")
+                    for args in arguments:
+                        args.for_g2p = True
+                        function = GeneratePronunciationsFunction(args)
+                        for dict_id, utt_id, phones in function.run():
+                            utt_id = int(utt_id.split("-")[-1])
+                            if utt_id not in texts or not texts[utt_id]:
+                                continue
+                            print(phones, file=output_files[dict_id])
+                            print(f"<s> {texts[utt_id]} </s>", file=input_files[dict_id])
+                            pbar.update(1)
             for f in input_files.values():
                 f.close()
             for f in output_files.values():
-                f.close()
-            for f in output_alignment_files.values():
                 f.close()
             self.pronunciations_complete = True
             os.makedirs(self.working_log_directory, exist_ok=True)
             dictionaries = session.query(Dictionary)
             shutil.copyfile(
-                self.phone_symbol_table_path, self.working_directory.joinpath("phones.txt")
+                self.phone_symbol_table_path, os.path.join(self.working_directory, "phones.txt")
             )
             shutil.copyfile(
                 self.grapheme_symbol_table_path,
-                self.working_directory.joinpath("graphemes.txt"),
+                os.path.join(self.working_directory, "graphemes.txt"),
             )
             self.input_token_type = self.grapheme_symbol_table_path
             self.output_token_type = self.phone_symbol_table_path
             for d in dictionaries:
-                logger.info(f"Training G2P for {d.name}...")
+                self.log_info(f"Training G2P for {d.name}...")
                 self._data_source = self.worker.dictionary_base_names[d.id]
-
                 begin = time.time()
                 if os.path.exists(self.far_path) and os.path.exists(self.encoder_path):
-                    logger.info("Alignment already done, skipping!")
+                    self.log_info("Alignment already done, skipping!")
                 else:
                     self.align_g2p()
-                    logger.debug(
-                        f"Aligning utterances for {d.name} took {time.time() - begin:.3f} seconds"
+                    self.log_debug(
+                        f"Aligning utterances for {d.name} took {time.time() - begin} seconds"
                     )
                 begin = time.time()
                 self.generate_model()
-                logger.debug(
-                    f"Generating model for {d.name} took {time.time() - begin:.3f} seconds"
-                )
-                os.rename(d.lexicon_fst_path, d.lexicon_fst_path.with_suffix(".backup"))
-                os.rename(self.fst_path, d.lexicon_fst_path)
-
-                if not GLOBAL_CONFIG.current_profile.debug:
-                    os.remove(self.output_path)
-                os.remove(self.input_far_path)
-                os.remove(self.output_far_path)
-                for f in os.listdir(self.working_directory):
-                    if any(f.endswith(x) for x in [".fst", ".like", ".far", ".enc"]):
-                        os.remove(self.working_directory.joinpath(f))
-
-                begin = time.time()
-                self.align_g2p(self.output_alignment_path)
-                logger.debug(
-                    f"Aligning utterances for {d.name} took {time.time() - begin:.3f} seconds"
-                )
-                begin = time.time()
-                self.generate_model()
-                logger.debug(
-                    f"Generating model for {d.name} took {time.time() - begin:.3f} seconds"
-                )
-                os.rename(d.align_lexicon_path, d.align_lexicon_path.with_suffix(".backup"))
-                os.rename(self.fst_path, d.align_lexicon_path)
-                if not GLOBAL_CONFIG.current_profile.debug:
-                    os.remove(self.output_alignment_path)
-                    os.remove(self.input_path)
-                    os.remove(self.input_far_path)
-                    os.remove(self.output_far_path)
-                for f in os.listdir(self.working_directory):
-                    if any(f.endswith(x) for x in [".fst", ".like", ".far", ".enc"]):
-                        os.remove(self.working_directory.joinpath(f))
+                self.log_debug(f"Generating model for {d.name} took {time.time() - begin} seconds")
+                os.rename(d.lexicon_fst_path, d.lexicon_fst_path + ".backup")
+                shutil.copy(self.fst_path, d.lexicon_fst_path)
                 d.use_g2p = True
             session.commit()
             self.worker.use_g2p = True
 
-    def export_model(self, output_model_path: Path) -> None:
+    def export_model(self, output_model_path: str) -> None:
         """
         Export an acoustic model to the specified path
 
@@ -280,25 +251,18 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
         """
         AcousticModelTrainingMixin.export_model(self, output_model_path)
 
-    def setup(self):
-        wf = self.worker.current_workflow
-        previous_directory = self.previous_aligner.working_directory
-        for j in self.jobs:
-            for p in j.construct_path_dictionary(previous_directory, "ali", "ark").values():
-                shutil.copy(p, wf.working_directory.joinpath(p.name))
-        for f in ["final.mdl", "final.alimdl", "final.occs", "lda.mat"]:
-            p = previous_directory.joinpath(f)
-            if os.path.exists(p):
-                shutil.copy(p, wf.working_directory.joinpath(p.name))
-
     def train_pronunciation_probabilities(self) -> None:
         """
         Train pronunciation probabilities based on previous alignment
         """
-        wf = self.worker.current_workflow
-        os.makedirs(os.path.join(wf.working_directory, "log"), exist_ok=True)
-        if wf.done:
-            logger.info(
+        working_dir = super(PronunciationProbabilityTrainer, self).working_directory
+        done_path = os.path.join(working_dir, "done")
+        dirty_path = os.path.join(working_dir, "dirty")
+        if os.path.exists(dirty_path):  # if there was an error, let's redo from scratch
+            shutil.rmtree(working_dir)
+        os.makedirs(working_dir, exist_ok=True)
+        if os.path.exists(done_path):
+            self.log_info(
                 "Pronunciation probability estimation already done, loading saved probabilities..."
             )
             self.training_complete = True
@@ -311,7 +275,7 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                             self.working_directory,
                             f"{self.worker.dictionary_base_names[d.id]}.fst",
                         )
-                        os.rename(d.lexicon_fst_path, d.lexicon_fst_path.with_suffix(".backup"))
+                        os.rename(d.lexicon_fst_path, d.lexicon_fst_path + ".backup")
                         shutil.copy(fst_path, d.lexicon_fst_path)
                         d.use_g2p = True
                     session.commit()
@@ -322,9 +286,7 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
             initial_silence_prob_sum = 0
             final_silence_correction_sum = 0
             final_non_silence_correction_sum = 0
-
             with self.worker.session() as session:
-
                 dictionaries = session.query(Dictionary).all()
                 for d in dictionaries:
                     pronunciations = (
@@ -334,26 +296,28 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                         .filter(Word.dictionary_id == d.id)
                     )
                     cache = {(x.word.word, x.pronunciation): x for x in pronunciations}
-                    new_dictionary_path = self.working_directory.joinpath(f"{d.id}.dict")
-                    for (
-                        word,
-                        pron,
-                        prob,
-                        silence_after_prob,
-                        silence_before_correct,
-                        non_silence_before_correct,
-                    ) in parse_dictionary_file(new_dictionary_path):
-                        if (word, " ".join(pron)) not in cache:
-                            continue
-                        p = cache[(word, " ".join(pron))]
-                        p.probability = prob
-                        p.silence_after_probability = silence_after_prob
-                        p.silence_before_correction = silence_before_correct
-                        p.non_silence_before_correction = non_silence_before_correct
+                    new_dictionary_path = os.path.join(working_dir, f"{d.id}.dict")
+                    with mfa_open(new_dictionary_path, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            line = line.split()
+                            word = line.pop(0)
+                            prob = float(line.pop(0))
+                            silence_after_prob = None
+                            silence_before_correct = None
+                            non_silence_before_correct = None
+                            if self.silence_probabilities:
+                                silence_after_prob = float(line.pop(0))
+                                silence_before_correct = float(line.pop(0))
+                                non_silence_before_correct = float(line.pop(0))
+                            pron = " ".join(line)
+                            p = cache[(word, pron)]
+                            p.probability = prob
+                            p.silence_after_probability = silence_after_prob
+                            p.silence_before_correction = silence_before_correct
+                            p.non_silence_before_correction = non_silence_before_correct
 
-                    silence_info_path = os.path.join(
-                        self.working_directory, f"{d.id}_silence_info.json"
-                    )
+                    silence_info_path = os.path.join(working_dir, f"{d.id}_silence_info.json")
                     with mfa_open(silence_info_path, "r") as f:
                         data = json.load(f)
                     if self.silence_probabilities:
@@ -365,7 +329,6 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                         initial_silence_prob_sum += d.initial_silence_probability
                         final_silence_correction_sum += d.final_silence_correction
                         final_non_silence_correction_sum += d.final_non_silence_correction
-
                 if self.silence_probabilities:
                     self.worker.silence_probability = silence_prob_sum / len(dictionaries)
                     self.worker.initial_silence_probability = initial_silence_prob_sum / len(
@@ -380,30 +343,26 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                 session.commit()
             self.worker.write_lexicon_information()
             return
-        self.setup()
         if self.train_g2p:
             self.train_g2p_lexicon()
         else:
-            os.makedirs(self.working_log_directory, exist_ok=True)
-            self.worker.compute_pronunciation_probabilities()
+            self.worker.compute_pronunciation_probabilities(self.silence_probabilities)
             self.worker.write_lexicon_information()
             with self.worker.session() as session:
                 for d in session.query(Dictionary):
-                    dict_path = self.working_directory.joinpath(f"{d.id}.dict")
-                    self.worker.export_trained_rules(self.working_directory)
+                    dict_path = os.path.join(working_dir, f"{d.id}.dict")
                     self.worker.export_lexicon(
                         d.id,
                         dict_path,
                         probability=True,
+                        silence_probabilities=self.silence_probabilities,
                     )
-                    silence_info_path = os.path.join(
-                        self.working_directory, f"{d.id}_silence_info.json"
-                    )
+                    silence_info_path = os.path.join(working_dir, f"{d.id}_silence_info.json")
                     with mfa_open(silence_info_path, "w") as f:
                         json.dump(d.silence_probability_info, f)
-        with self.session() as session:
-            session.query(CorpusWorkflow).filter(CorpusWorkflow.id == wf.id).update({"done": True})
-            session.commit()
+        self.training_complete = True
+        with mfa_open(done_path, "w"):
+            pass
 
     def train_iteration(self) -> None:
         """Training iteration"""

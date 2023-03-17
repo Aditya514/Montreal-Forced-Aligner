@@ -38,32 +38,27 @@ from montreal_forced_aligner.utils import get_mfa_version  # noqa
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 extensions = [
-    "sphinx_needs",
     "sphinx.ext.autodoc",
     "sphinx.ext.autosummary",
     "sphinx.ext.coverage",
     "sphinx.ext.mathjax",
     "sphinx.ext.intersphinx",
     "sphinx.ext.extlinks",
-    "myst_parser",
     "external_links",
     # "numpydoc",
     "sphinx.ext.napoleon",
     "sphinx_design",
     "sphinx.ext.viewcode",
-    "sphinx_click",
+    "sphinxcontrib.autoprogram",
+    "sphinxemoji.sphinxemoji",
     # "sphinx_autodoc_typehints",
 ]
-myst_enable_extensions = ["colon_fence"]
-locale_dirs = ["locale/"]  # path is example but recommended.
-gettext_compact = False  # optional.
 panels_add_bootstrap_css = False
 intersphinx_mapping = {
     "sqlalchemy": ("https://docs.sqlalchemy.org/en/14/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
     "python": ("https://docs.python.org/3", None),
     "Bio": ("https://biopython.org/docs/latest/api/", None),
-    "click": ("https://click.palletsprojects.com/en/8.1.x/", None),
 }
 rst_prolog = """
 .. role:: ipa_inline
@@ -78,17 +73,9 @@ extlinks = {
 xref_links = {
     "mfa_models": ("MFA Models", "https://mfa-models.readthedocs.io/"),
     "anchor": ("Anchor Annotator", "https://anchor-annotator.readthedocs.io/en/latest/"),
-    "speechbrain": ("SpeechBrain", "https://speechbrain.github.io/"),
-    "scikit-learn": ("scikit-learn", "https://scikit-learn.org/stable/index.html"),
-    "click": ("click", "https://click.palletsprojects.com/en/8.1.x/"),
-    "pgvector": ("pgvector", "https://github.com/pgvector/pgvector"),
     "pretrained_acoustic_models": (
         "MFA acoustic models",
         "https://mfa-models.readthedocs.io/en/latest/acoustic/index.html",
-    ),
-    "pretrained_tokenizer_models": (
-        "MFA tokenizer models",
-        "https://mfa-models.readthedocs.io/en/latest/tokenizer/index.html",
     ),
     "pretrained_dictionaries": (
         "MFA dictionaries",
@@ -97,10 +84,6 @@ xref_links = {
     "pretrained_g2p": (
         "MFA G2P models",
         "https://mfa-models.readthedocs.io/en/latest/g2p/index.html",
-    ),
-    "pretrained_ivector_extractor": (
-        "MFA G2P models",
-        "https://mfa-models.readthedocs.io/en/latest/ivector/index.html",
     ),
     "pretrained_language_models": (
         "MFA language models",
@@ -191,8 +174,10 @@ autodoc_type_aliases = {
     "MultispeakerDictionary": "montreal_forced_aligner.dictionary.MultispeakerDictionary",
     "Trainer": "montreal_forced_aligner.abc.Trainer",
     "Aligner": "montreal_forced_aligner.abc.Aligner",
+    "FeatureConfig": "montreal_forced_aligner.config.FeatureConfig",
     "multiprocessing.context.Process": "multiprocessing.Process",
     "mp.Process": "multiprocessing.Process",
+    "Namespace": "argparse.Namespace",
     "MetaDict": "dict[str, Any]",
 }
 
@@ -352,15 +337,14 @@ html_theme_options = {
         "text": "Montreal Forced Aligner",
         # "image_dark": "logo-dark.svg",
     },
-    "analytics": {
-        "google_analytics_id": "G-5NGNLY0CWX",
-    },
-    # "show_nav_level": 1,
-    # "navigation_depth": 4,
-    # "show_toc_level": 2,
-    # "collapse_navigation": True,
+    "google_analytics_id": "UA-73068199-4",
+    "show_nav_level": 1,
+    "navigation_depth": 4,
+    "show_toc_level": 2,
+    "collapse_navigation": False,
 }
 html_context = {
+    # "github_url": "https://github.com", # or your GitHub Enterprise interprise
     "github_user": "MontrealCorpusTools",
     "github_repo": "Montreal-Forced-Aligner",
     "github_version": "main",
@@ -396,7 +380,7 @@ html_context = {
 html_static_path = ["_static"]
 html_css_files = [
     "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/fontawesome.min.css",
-    "css/mfa.css",
+    "css/style.css",
 ]
 
 # Add any extra paths that contain custom files (such as robots.txt or
@@ -419,7 +403,6 @@ html_css_files = [
 # Custom sidebar templates, maps document names to template names.
 #
 # html_sidebars = { '**': ['globaltoc.html', 'relations.html', 'sourcelink.html', 'searchbox.html'], }
-
 html_sidebars = {"**": ["search-field.html", "sidebar-nav-bs.html", "sidebar-ethical-ads.html"]}
 # Additional templates that should be rendered to pages, maps page names to
 # template names.

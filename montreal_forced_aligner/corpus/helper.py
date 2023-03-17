@@ -1,11 +1,10 @@
 """Helper functions for corpus parsing and loading"""
 from __future__ import annotations
 
-import re
+import datetime
 import subprocess
 import sys
 import typing
-from pathlib import Path
 
 import soundfile
 
@@ -109,17 +108,16 @@ def get_wav_info(
         Sound information for format, duration, number of channels, bit depth, and
         sox_string for use in Kaldi feature extraction if necessary
     """
-    if isinstance(file_path, str):
-        file_path = Path(file_path)
-    format = file_path.suffix.lower()
+    _, format = file_path.rsplit(".", maxsplit=1)
+    format = format.lower()
     num_channels = 0
     sample_rate = 0
     duration = 0
     sox_string = ""
-    if format in {".mp3", ".opus"}:
-        if sys.platform != "win32" and format == ".mp3":
+    if format in {"mp3", "opus"}:
+        if sys.platform != "win32" and format == "mp3":
             sox_proc = subprocess.Popen(
-                ["soxi", file_path], stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+                ["soxi", f"{file_path}"], stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True
             )
             stdout, stderr = sox_proc.communicate()
             if stderr:
@@ -130,12 +128,11 @@ def get_wav_info(
                 elif line.startswith("Sample Rate"):
                     sample_rate = int(line.split(":")[-1].strip())
                 elif line.startswith("Duration"):
-                    m = re.search(r"= (?P<num_samples>\d+) samples", line)
-                    if m:
-                        num_samples = int(m.group("num_samples"))
-                        duration = round(num_samples / sample_rate, 6)
-                    else:
-                        raise SoundFileError(file_path, "Could not parse number of samples")
+                    duration_string = line.split(":", maxsplit=1)[-1].split("=")[0].strip()
+                    duration = (
+                        datetime.datetime.strptime(duration_string, "%H:%M:%S.%f")
+                        - datetime.datetime(1900, 1, 1)
+                    ).total_seconds()
                     break
             sample_rate_string = ""
             if enforce_sample_rate is not None:

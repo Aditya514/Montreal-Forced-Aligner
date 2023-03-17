@@ -8,20 +8,17 @@ from __future__ import annotations
 import functools
 import itertools
 import json
-import logging
 import re
 import typing
 from contextlib import contextmanager
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type, Union
 
+import ansiwrap
 import dataclassy
 import numpy
 import yaml
 from Bio import pairwise2
-from rich.console import Console
-from rich.logging import RichHandler
-from rich.theme import Theme
+from colorama import Fore, Style
 
 if TYPE_CHECKING:
     from montreal_forced_aligner.abc import MetaDict
@@ -29,6 +26,7 @@ if TYPE_CHECKING:
 
 
 __all__ = [
+    "TerminalPrinter",
     "comma_join",
     "make_safe",
     "make_scp_safe",
@@ -41,24 +39,7 @@ __all__ = [
     "compare_labels",
     "overlap_scoring",
     "align_phones",
-    "split_phone_position",
-    "configure_logger",
-    "mfa_open",
-    "load_configuration",
 ]
-
-
-console = Console(
-    theme=Theme(
-        {
-            "logging.level.debug": "cyan",
-            "logging.level.info": "green",
-            "logging.level.warning": "yellow",
-            "logging.level.error": "red",
-        }
-    ),
-    stderr=True,
-)
 
 
 @contextmanager
@@ -79,13 +60,13 @@ def mfa_open(path, mode="r", encoding="utf8", newline=""):
         file.close()
 
 
-def load_configuration(config_path: typing.Union[str, Path]) -> Dict[str, Any]:
+def load_configuration(config_path: str) -> Dict[str, Any]:
     """
     Load a configuration file
 
     Parameters
     ----------
-    config_path: :class:`~pathlib.Path`
+    config_path: str
         Path to yaml or json configuration file
 
     Returns
@@ -94,12 +75,10 @@ def load_configuration(config_path: typing.Union[str, Path]) -> Dict[str, Any]:
         Configuration dictionary
     """
     data = {}
-    if not isinstance(config_path, Path):
-        config_path = Path(config_path)
     with mfa_open(config_path, "r") as f:
-        if config_path.suffix == ".yaml":
-            data = yaml.load(f, Loader=yaml.Loader)
-        elif config_path.suffix == ".json":
+        if config_path.endswith(".yaml"):
+            data = yaml.load(f, Loader=yaml.SafeLoader)
+        elif config_path.endswith(".json"):
             data = json.load(f)
     if not data:
         return {}
@@ -120,13 +99,7 @@ def split_phone_position(phone_label: str) -> List[str]:
     List[str]
         Phone and position
     """
-    phone = phone_label
-    pos = None
-    try:
-        phone, pos = phone_label.rsplit("_", maxsplit=1)
-    except ValueError:
-        pass
-    return phone, pos
+    return phone_label.rsplit("_", maxsplit=1)
 
 
 def parse_old_features(config: MetaDict) -> MetaDict:
@@ -168,42 +141,357 @@ def parse_old_features(config: MetaDict) -> MetaDict:
     return config
 
 
-def configure_logger(identifier: str, log_file: Optional[Path] = None) -> None:
+class TerminalPrinter:
     """
-    Configure logging for the given identifier
+    Helper class to output colorized text
 
     Parameters
     ----------
-    identifier: str
-        Logger identifier
-    log_file: str
-        Path to file to write all messages to
-    quiet: bool
-        Flag for whether logger should write to stdout
-    verbose: bool
-        Flag for writing debug level information to stdout
-    """
-    from montreal_forced_aligner.config import MfaConfiguration
+    print_function: Callable, optional
+        Function to print information, defaults to :func:`print`
 
-    config = MfaConfiguration()
-    logger = logging.getLogger(identifier)
-    logger.setLevel(logging.DEBUG)
-    if log_file is not None:
-        file_handler = logging.FileHandler(log_file, encoding="utf8")
-        file_handler.setLevel(logging.DEBUG)
-        formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    elif not config.current_profile.quiet:
-        handler = RichHandler(
-            rich_tracebacks=True, log_time_format="", console=console, show_path=False
-        )
-        if config.current_profile.verbose:
-            handler.setLevel(logging.DEBUG)
+    Attributes
+    ----------
+    colors: dict[str, str]
+        Mapping of color names to terminal codes in colorama (or empty strings
+        if the global terminal_colors flag is set to False)
+    """
+
+    def __init__(self, print_function: typing.Callable = None):
+        if print_function is not None:
+            self.print_function = print_function
         else:
-            handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        logger.addHandler(handler)
+            self.print_function = print
+        from .config import load_global_config
+
+        c = load_global_config()
+        self.colors = {}
+        self.colors["bright"] = ""
+        self.colors["green"] = ""
+        self.colors["red"] = ""
+        self.colors["blue"] = ""
+        self.colors["cyan"] = ""
+        self.colors["yellow"] = ""
+        self.colors["reset"] = ""
+        self.colors["normal"] = ""
+        self.width = c["terminal_width"]
+        self.indent_level = 0
+        self.indent_size = 2
+        if c["terminal_colors"]:
+            self.colors["bright"] = Style.BRIGHT
+            self.colors["green"] = Fore.GREEN
+            self.colors["red"] = Fore.RED
+            self.colors["blue"] = Fore.BLUE
+            self.colors["cyan"] = Fore.CYAN
+            self.colors["yellow"] = Fore.YELLOW
+            self.colors["reset"] = Style.RESET_ALL
+            self.colors["normal"] = Style.NORMAL
+
+    def error_text(self, text: Any) -> str:
+        """
+        Highlight text as an error
+
+        Parameters
+        ----------
+        text: Any
+            Text to highlight
+
+        Returns
+        -------
+        str
+            Highlighted text
+        """
+        return self.colorize(text, "red")
+
+    def emphasized_text(self, text: Any) -> str:
+        """
+        Highlight text as emphasis
+
+        Parameters
+        ----------
+        text: Any
+            Text to highlight
+
+        Returns
+        -------
+        str
+            Highlighted text
+        """
+        return self.colorize(text, "bright")
+
+    def pass_text(self, text: Any) -> str:
+        """
+        Highlight text as good
+
+        Parameters
+        ----------
+        text: Any
+            Text to highlight
+
+        Returns
+        -------
+        str
+            Highlighted text
+        """
+        return self.colorize(text, "green")
+
+    def warning_text(self, text: Any) -> str:
+        """
+        Highlight text as a warning
+
+        Parameters
+        ----------
+        text: Any
+            Text to highlight
+
+        Returns
+        -------
+        str
+            Highlighted text
+        """
+        return self.colorize(text, "yellow")
+
+    @property
+    def indent_string(self) -> str:
+        """Indent string to use in formatting the output messages"""
+        return " " * self.indent_size * self.indent_level
+
+    def print_header(self, header: str) -> None:
+        """
+        Print a section header
+
+        Parameters
+        ----------
+        header: str
+            Section header string
+        """
+        self.indent_level = 0
+        self.print_function()
+        underline = "*" * len(header)
+        self.print_function(self.colorize(underline, "bright"))
+        self.print_function(self.colorize(header, "bright"))
+        self.print_function(self.colorize(underline, "bright"))
+        self.print_function()
+        self.indent_level += 1
+
+    def print_sub_header(self, header: str) -> None:
+        """
+        Print a subsection header
+
+        Parameters
+        ----------
+        header: str
+            Subsection header string
+        """
+        underline = "=" * len(header)
+        self.print_function(self.indent_string + self.colorize(header, "bright"))
+        self.print_function(self.indent_string + self.colorize(underline, "bright"))
+        self.print_function()
+        self.indent_level += 1
+
+    def print_end_section(self) -> None:
+        """Mark the end of a section"""
+        self.indent_level -= 1
+        self.print_function()
+
+    def format_info_lines(self, lines: Union[list[str], str]) -> List[str]:
+        """
+        Format lines
+
+        Parameters
+        ----------
+        lines: Union[list[str], str
+            Lines to format
+
+        Returns
+        -------
+        str
+            Formatted string
+        """
+        if isinstance(lines, str):
+            lines = [lines]
+
+        for i, line in enumerate(lines):
+            lines[i] = ansiwrap.fill(
+                line,
+                initial_indent=self.indent_string,
+                subsequent_indent=" " * self.indent_size * (self.indent_level + 1),
+                width=self.width,
+                break_on_hyphens=False,
+                break_long_words=False,
+                drop_whitespace=False,
+            )
+        return lines
+
+    def print_info_lines(self, lines: Union[list[str], str]) -> None:
+        """
+        Print formatted information lines
+
+        Parameters
+        ----------
+        lines: Union[list[str], str
+            Lines to format
+        """
+        if isinstance(lines, str):
+            lines = [lines]
+        lines = self.format_info_lines(lines)
+        for line in lines:
+            self.print_function(line)
+
+    def print_green_stat(self, stat: Any, text: str) -> None:
+        """
+        Print a statistic in green
+
+        Parameters
+        ----------
+        stat: Any
+            Statistic to print
+        text: str
+            Other text to follow statistic
+        """
+        self.print_function(self.indent_string + f"{self.colorize(stat, 'green')} {text}")
+
+    def print_yellow_stat(self, stat, text) -> None:
+        """
+        Print a statistic in yellow
+
+        Parameters
+        ----------
+        stat: Any
+            Statistic to print
+        text: str
+            Other text to follow statistic
+        """
+        self.print_function(self.indent_string + f"{self.colorize(stat, 'yellow')} {text}")
+
+    def print_red_stat(self, stat, text) -> None:
+        """
+        Print a statistic in red
+
+        Parameters
+        ----------
+        stat: Any
+            Statistic to print
+        text: str
+            Other text to follow statistic
+        """
+        self.print_function(self.indent_string + f"{self.colorize(stat, 'red')} {text}")
+
+    def colorize(self, text: Any, color: str) -> str:
+        """
+        Colorize a string
+
+        Parameters
+        ----------
+        text: Any
+            Text to colorize
+        color: str
+            Colorama code or empty string to wrap the text
+
+        Returns
+        -------
+        str
+            Colorized string
+        """
+        return f"{self.colors[color]}{text}{self.colors['reset']}"
+
+    def print_block(self, block: dict, starting_level: int = 1) -> None:
+        """
+        Print a configuration block
+
+        Parameters
+        ----------
+        block: dict
+            Configuration options to output
+        starting_level: int
+            Starting indentation level
+        """
+        for k, v in block.items():
+            value_color = None
+            key_color = None
+            value = ""
+            if isinstance(k, tuple):
+                k, key_color = k
+
+            if isinstance(v, tuple):
+                value, value_color = v
+            elif not isinstance(v, dict):
+                value = v
+            self.print_information_line(k, value, key_color, value_color, starting_level)
+            if isinstance(v, dict):
+                self.print_block(v, starting_level=starting_level + 1)
+        self.print_function()
+
+    def print_config(self, configuration: MetaDict) -> None:
+        """
+        Pretty print a configuration
+
+        Parameters
+        ----------
+        configuration: dict[str, Any]
+            Configuration to print
+        """
+        for k, v in configuration.items():
+            if "name" in v:
+                name = v["name"]
+                name_color = None
+                if isinstance(name, tuple):
+                    name, name_color = name
+                self.print_information_line(k, name, value_color=name_color, level=0)
+            if "data" in v:
+                self.print_block(v["data"])
+
+    def print_information_line(
+        self,
+        key: str,
+        value: Any,
+        key_color: Optional[str] = None,
+        value_color: Optional[str] = None,
+        level: int = 1,
+    ) -> None:
+        """
+        Pretty print a given configuration line
+
+        Parameters
+        ----------
+        key: str
+            Configuration key
+        value: Any
+            Configuration value
+        key_color: str
+            Key color
+        value_color: str
+            Value color
+        level: int
+            Indentation level
+        """
+        if key_color is None:
+            key_color = "bright"
+        if value_color is None:
+            value_color = "cyan"
+            if isinstance(value, bool):
+                if value:
+                    value_color = "green"
+                else:
+                    value_color = "red"
+        if isinstance(value, (list, tuple, set)):
+            value = comma_join([self.colorize(x, value_color) for x in sorted(value)])
+        else:
+            value = self.colorize(str(value), value_color)
+        indent = ("  " * level) + "-"
+        subsequent_indent = "  " * (level + 1)
+        if key:
+            key = f" {key}:"
+            subsequent_indent += " " * (len(key))
+
+        self.print_function(
+            ansiwrap.fill(
+                f"{self.colorize(key, key_color)} {value}",
+                width=self.width,
+                initial_indent=indent,
+                subsequent_indent=subsequent_indent,
+            )
+        )
 
 
 def comma_join(sequence: List[Any]) -> str:
@@ -310,7 +598,7 @@ def load_scp_safe(string: str) -> str:
     return string.replace("_MFASPACE_", " ")
 
 
-def output_mapping(mapping: Dict[str, Any], path: Path, skip_safe: bool = False) -> None:
+def output_mapping(mapping: Dict[str, Any], path: str, skip_safe: bool = False) -> None:
     """
     Helper function to save mapping information (i.e., utt2spk) in Kaldi scp format
 
@@ -321,7 +609,7 @@ def output_mapping(mapping: Dict[str, Any], path: Path, skip_safe: bool = False)
     ----------
     mapping: dict[str, Any]
         Mapping to output
-    path: :class:`~pathlib.Path`
+    path: str
         Path to save mapping
     skip_safe: bool, optional
         Flag for whether to skip over making a string safe
@@ -338,7 +626,7 @@ def output_mapping(mapping: Dict[str, Any], path: Path, skip_safe: bool = False)
             f.write(f"{make_scp_safe(k)} {v}\n")
 
 
-def load_scp(path: Path, data_type: Optional[Type] = str) -> Dict[str, Any]:
+def load_scp(path: str, data_type: Optional[Type] = str) -> Dict[str, Any]:
     """
     Load a Kaldi script file (.scp)
 
@@ -355,7 +643,7 @@ def load_scp(path: Path, data_type: Optional[Type] = str) -> Dict[str, Any]:
 
     Parameters
     ----------
-    path : :class:`~pathlib.Path`
+    path : str
         Path to Kaldi script file
     data_type : type
         Type to coerce the data to
@@ -579,7 +867,6 @@ def align_phones(
     silence_phone: str,
     ignored_phones: typing.Set[str] = None,
     custom_mapping: Optional[Dict[str, str]] = None,
-    debug: bool = False,
 ) -> Tuple[float, float]:
     """
     Align phones based on how much they overlap and their phone label, with the ability to specify a custom mapping for
@@ -612,7 +899,17 @@ def align_phones(
         score_func = functools.partial(
             overlap_scoring, silence_phone=silence_phone, mapping=custom_mapping
         )
-
+        coalesced_phones = {tuple(x.split()) for x in custom_mapping.keys() if " " in x}
+        if coalesced_phones:
+            for cp in coalesced_phones:
+                custom_mapping["".join(cp)] = custom_mapping[" ".join(cp)]
+            coalesced = []
+            for t in test:
+                if coalesced and (coalesced[-1].label, t.label) in coalesced_phones:
+                    coalesced[-1].label += t.label
+                    coalesced[-1].end = t.end
+                    continue
+                coalesced.append(t)
     alignments = pairwise2.align.globalcs(
         ref, test, score_func, -5, -5, gap_char=["-"], one_alignment_only=True
     )
@@ -641,27 +938,9 @@ def align_phones(
                 overlap_count += 1
                 if compare_labels(sa.label, sb.label, silence_phone, mapping=custom_mapping) > 0:
                     num_substitutions += 1
-    if debug:
-        import logging
-
-        logger = logging.getLogger("mfa")
-        logger.debug(pairwise2.format_alignment(*alignments[0]))
     if overlap_count:
         score = overlap_sum / overlap_count
     else:
         score = None
     phone_error_rate = (num_insertions + num_deletions + (2 * num_substitutions)) / len(ref)
     return score, phone_error_rate
-
-
-def format_probability(probability_value: float) -> float:
-    """Format a probability to have two decimal places and be between 0.01 and 0.99"""
-    return min(max(round(probability_value, 2), 0.01), 0.99)
-
-
-def format_correction(correction_value: float, positive_only=True) -> float:
-    """Format a probability correction value to have two decimal places and be  greater than 0.01"""
-    correction_value = round(correction_value, 2)
-    if correction_value <= 0 and positive_only:
-        correction_value = 0.01
-    return correction_value

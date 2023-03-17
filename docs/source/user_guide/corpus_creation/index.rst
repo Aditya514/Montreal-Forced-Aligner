@@ -18,12 +18,10 @@ MFA now contains several command line utilities for helping to create corpora fr
 .. toctree::
    :hidden:
 
-   create_segments
-   train_ivector
-   diarize_speakers
-   transcribing
-   training_lm
-   training_dictionary
-   tokenize
-   train_tokenizer
-   anchor
+   create_segments.rst
+   train_ivector.rst
+   classify_speakers.rst
+   transcribing.rst
+   training_lm.rst
+   training_dictionary.rst
+   anchor.rst

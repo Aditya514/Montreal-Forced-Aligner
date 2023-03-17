@@ -6,17 +6,14 @@ Model classes
 from __future__ import annotations
 
 import json
-import logging
 import os
 import shutil
 import typing
-from pathlib import Path
 from shutil import copy, copyfile, make_archive, move, rmtree, unpack_archive
 from typing import TYPE_CHECKING, Collection, Dict, List, Optional, Tuple, Union
 
 import requests
 import yaml
-from rich.pretty import pprint
 
 from montreal_forced_aligner.abc import MfaModel, ModelExporterMixin
 from montreal_forced_aligner.data import PhoneSetType
@@ -24,25 +21,24 @@ from montreal_forced_aligner.exceptions import (
     LanguageModelNotFoundError,
     ModelLoadError,
     ModelsConnectionError,
+    PretrainedModelNotFoundError,
     PronunciationAcousticMismatchError,
-    RemoteModelNotFoundError,
 )
-from montreal_forced_aligner.helper import EnhancedJSONEncoder, mfa_open
+from montreal_forced_aligner.helper import EnhancedJSONEncoder, TerminalPrinter, mfa_open
+from montreal_forced_aligner.utils import configure_logger
 
 if TYPE_CHECKING:
     from dataclasses import dataclass
+    from logging import Logger
 
     from montreal_forced_aligner.abc import MetaDict
     from montreal_forced_aligner.dictionary.mixins import DictionaryMixin
     from montreal_forced_aligner.g2p.trainer import G2PTrainer
-    from montreal_forced_aligner.tokenization.trainer import TokenizerTrainer
 else:
     from dataclassy import dataclass
 
 # default format for output
 FORMAT = "zip"
-
-logger = logging.getLogger("mfa")
 
 __all__ = [
     "Archive",
@@ -58,13 +54,13 @@ __all__ = [
 ]
 
 
-def guess_model_type(path: Path) -> List[str]:
+def guess_model_type(path: str) -> List[str]:
     """
     Guess a model type given a path
 
     Parameters
     ----------
-    path: :class:`~pathlib.Path`
+    path: str
         Model archive to guess
 
     Returns
@@ -92,9 +88,9 @@ class Archive(MfaModel):
 
     Parameters
     ----------
-    source: :class:`~pathlib.Path`
+    source: str
         Source path
-    root_directory: :class:`~pathlib.Path`
+    root_directory: str
         Root directory to unpack and store temporary files
     """
 
@@ -102,42 +98,32 @@ class Archive(MfaModel):
 
     model_type = None
 
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
+    def __init__(self, source: str, root_directory: Optional[str] = None):
         from .config import get_temporary_directory
 
-        if isinstance(source, str):
-            source = Path(source)
-        source = source.resolve()
         if root_directory is None:
-            root_directory = get_temporary_directory().joinpath(
-                "extracted_models", self.model_type
+            root_directory = os.path.join(
+                get_temporary_directory(), "extracted_models", self.model_type
             )
-        if isinstance(root_directory, str):
-            root_directory = Path(root_directory)
         self.root_directory = root_directory
         self.source = source
         self._meta = {}
-        self.name = source.stem
+        self.name, _ = os.path.splitext(os.path.basename(source))
         if os.path.isdir(source):
-            self.dirname = source
+            self.dirname = os.path.abspath(source)
         else:
-            self.dirname = root_directory.joinpath(f"{self.name}_{self.model_type}")
-            if self.dirname.exists():
+            self.dirname = os.path.join(root_directory, f"{self.name}_{self.model_type}")
+            if os.path.exists(self.dirname):
                 shutil.rmtree(self.dirname, ignore_errors=True)
 
             os.makedirs(root_directory, exist_ok=True)
             unpack_archive(source, self.dirname)
-            files = [x for x in self.dirname.iterdir()]
-            old_dir_path = self.dirname.joinpath(files[0])
-            if len(files) == 1 and old_dir_path.is_dir():  # Backwards compatibility
-                for f in old_dir_path.iterdir():
-                    f = f.relative_to(old_dir_path)
-                    move(old_dir_path.joinpath(f), self.dirname.joinpath(f))
-                old_dir_path.rmdir()
+            files = os.listdir(self.dirname)
+            old_dir_path = os.path.join(self.dirname, files[0])
+            if len(files) == 1 and os.path.isdir(old_dir_path):  # Backwards compatibility
+                for f in os.listdir(old_dir_path):
+                    move(os.path.join(old_dir_path, f), os.path.join(self.dirname, f))
+                os.rmdir(old_dir_path)
 
     def parse_old_features(self) -> None:
         """
@@ -157,16 +143,16 @@ class Archive(MfaModel):
                 del self._meta["features"][key]
         if "uses_splices" not in self._meta["features"]:  # Backwards compatibility
             self._meta["features"]["uses_splices"] = os.path.exists(
-                self.dirname.joinpath("lda.mat")
+                os.path.join(self.dirname, "lda.mat")
             )
         if "uses_speaker_adaptation" not in self._meta["features"]:
             self._meta["features"]["uses_speaker_adaptation"] = os.path.exists(
-                self.dirname.joinpath("final.alimdl")
+                os.path.join(self.dirname, "final.alimdl")
             )
 
     def get_subclass_object(
         self,
-    ) -> Union[AcousticModel, G2PModel, LanguageModel, TokenizerModel, IvectorExtractorModel]:
+    ) -> Union[AcousticModel, G2PModel, LanguageModel, IvectorExtractorModel]:
         """
         Instantiate subclass models based on files contained in the archive
 
@@ -180,28 +166,25 @@ class Archive(MfaModel):
         :class:`~montreal_forced_aligner.exceptions.ModelLoadError`
             If the model type cannot be determined
         """
-        files = [x.name for x in self.dirname.iterdir()]
-
-        if "tree" in files:
-            return AcousticModel(self.dirname, self.root_directory)
-        if "phones.sym" in files or "phones.txt" in files:
-            return G2PModel(self.dirname, self.root_directory)
-        if any(f.endswith(".arpa") for f in files):
-            return LanguageModel(self.dirname, self.root_directory)
-        if "final.ie" in files:
-            return IvectorExtractorModel(self.dirname, self.root_directory)
-        if "tokenizer.fst" in files:
-            return TokenizerModel(self.dirname, self.root_directory)
+        for f in os.listdir(self.dirname):
+            if f == "tree":
+                return AcousticModel(self.dirname, self.root_directory)
+            if f in {"phones.sym", "phones.txt"}:
+                return G2PModel(self.dirname, self.root_directory)
+            if f.endswith(".arpa"):
+                return LanguageModel(self.dirname, self.root_directory)
+            if f == "final.ie":
+                return IvectorExtractorModel(self.dirname, self.root_directory)
         raise ModelLoadError(self.source)
 
     @classmethod
-    def valid_extension(cls, filename: Path) -> bool:
+    def valid_extension(cls, filename: str) -> bool:
         """
         Check whether a file has a valid extension for the given model archive
 
         Parameters
         ----------
-        filename: :class:`~pathlib.Path`
+        filename: str
             File name to check
 
         Returns
@@ -209,20 +192,18 @@ class Archive(MfaModel):
         bool
             True if the extension matches the models allowed extensions
         """
-        if filename.suffix in cls.extensions:
+        if os.path.splitext(filename)[1] in cls.extensions:
             return True
         return False
 
     @classmethod
-    def generate_path(
-        cls, root: Path, name: str, enforce_existence: bool = True
-    ) -> Optional[Path]:
+    def generate_path(cls, root: str, name: str, enforce_existence: bool = True) -> Optional[str]:
         """
         Generate a path for a given model from the root directory and the name of the model
 
         Parameters
         ----------
-        root: :class:`~pathlib.Path`
+        root: str
             Root directory for the full path
         name: str
             Name of the model
@@ -231,20 +212,22 @@ class Archive(MfaModel):
 
         Returns
         -------
-        Path
+        str
            Full path in the root directory for the model
         """
         for ext in cls.extensions:
-            path = root.joinpath(name + ext)
-            if path.exists() or not enforce_existence:
+            path = os.path.join(root, name + ext)
+            if os.path.exists(path) or not enforce_existence:
                 return path
         return None
 
     def pretty_print(self) -> None:
         """
-        Pretty print the archive's meta data using rich
+        Pretty print the archive's meta data using TerminalPrinter
         """
-        pprint({"Archive": {"name": self.name, "data": self.meta}})
+        printer = TerminalPrinter()
+        configuration_data = {"Archive": {"name": (self.name, "green"), "data": self.meta}}
+        printer.print_config(configuration_data)
 
     @property
     def meta(self) -> dict:
@@ -252,14 +235,14 @@ class Archive(MfaModel):
         Get the meta data associated with the model
         """
         if not self._meta:
-            meta_path = self.dirname.joinpath("meta.json")
+            meta_path = os.path.join(self.dirname, "meta.json")
             format = "json"
             if not os.path.exists(meta_path):
-                meta_path = self.dirname.joinpath("meta.yaml")
+                meta_path = os.path.join(self.dirname, "meta.yaml")
                 format = "yaml"
             with mfa_open(meta_path, "r") as f:
                 if format == "yaml":
-                    self._meta = yaml.load(f, Loader=yaml.Loader)
+                    self._meta = yaml.safe_load(f)
                 else:
                     self._meta = json.load(f)
         self.parse_old_features()
@@ -274,15 +257,13 @@ class Archive(MfaModel):
         trainer: :class:`~montreal_forced_aligner.abc.ModelExporterMixin`
             The trainer to construct the metadata from
         """
-        with mfa_open(self.dirname.joinpath("meta.json"), "w") as f:
-            json.dump(trainer.meta, f, ensure_ascii=False)
+        with mfa_open(os.path.join(self.dirname, "meta.json"), "w") as f:
+            json.dump(trainer.meta, f)
 
     @classmethod
     def empty(
-        cls, head: str, root_directory: Optional[typing.Union[str, Path]] = None
-    ) -> Union[
-        Archive, IvectorExtractorModel, AcousticModel, G2PModel, TokenizerModel, LanguageModel
-    ]:
+        cls, head: str, root_directory: Optional[str] = None
+    ) -> Union[Archive, IvectorExtractorModel, AcousticModel, G2PModel, LanguageModel]:
         """
         Initialize an archive using an empty directory
 
@@ -295,17 +276,18 @@ class Archive(MfaModel):
 
         Returns
         -------
-        :class:`~montreal_forced_aligner.models.Archive`, :class:`~montreal_forced_aligner.models.AcousticModel`, :class:`~montreal_forced_aligner.models.G2PModel`, :class:`~montreal_forced_aligner.models.LanguageModel`, :class:`~montreal_forced_aligner.models.TokenizerModel`, or :class:`~montreal_forced_aligner.models.IvectorExtractorModel`
+        :class:`~montreal_forced_aligner.models.Archive`, :class:`~montreal_forced_aligner.models.AcousticModel`, :class:`~montreal_forced_aligner.models.G2PModel`, :class:`~montreal_forced_aligner.models.LanguageModel`, or :class:`~montreal_forced_aligner.models.IvectorExtractorModel`
             Model constructed from the empty directory
         """
         from .config import get_temporary_directory
 
         if root_directory is None:
-            root_directory = get_temporary_directory().joinpath("temp_models", cls.model_type)
+            root_directory = os.path.join(get_temporary_directory(), "temp_models", cls.model_type)
 
-        source = root_directory.joinpath(head)
-        source.mkdir(parents=True, exist_ok=True)
-        return cls(source, root_directory)
+        os.makedirs(root_directory, exist_ok=True)
+        source = os.path.join(root_directory, head)
+        os.makedirs(source, exist_ok=True)
+        return cls(source)
 
     def add(self, source: str):
         """
@@ -326,13 +308,13 @@ class Archive(MfaModel):
         """Remove temporary directory"""
         rmtree(self.dirname)
 
-    def dump(self, path: Path, archive_fmt: str = FORMAT) -> str:
+    def dump(self, path: str, archive_fmt: str = FORMAT) -> str:
         """
         Write archive to disk, and return the name of final archive
 
         Parameters
         ----------
-        path: :class:`~pathlib.Path`
+        path: str
             Path to write to
         archive_fmt: str, optional
             Archive extension to use, defaults to ".zip"
@@ -355,11 +337,8 @@ class AcousticModel(Archive):
     files = [
         "final.mdl",
         "final.alimdl",
+        "final.occs",
         "lda.mat",
-        "phone_pdf.counts",
-        # "rules.yaml",
-        "tokenizer.fst",
-        "phone_lm.fst",
         "tree",
         "phones.txt",
         "graphemes.txt",
@@ -368,11 +347,7 @@ class AcousticModel(Archive):
 
     model_type = "acoustic"
 
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
+    def __init__(self, source: str, root_directory: Optional[str] = None):
         if source in AcousticModel.get_available_models():
             source = AcousticModel.get_pretrained_path(source)
 
@@ -387,8 +362,8 @@ class AcousticModel(Archive):
         trainer: :class:`~montreal_forced_aligner.abc.ModelExporterMixin`
             Trainer to supply metadata information about the acoustic model
         """
-        with mfa_open(self.dirname.joinpath("meta.json"), "w") as f:
-            json.dump(trainer.meta, f, ensure_ascii=False)
+        with mfa_open(os.path.join(self.dirname, "meta.json"), "w") as f:
+            json.dump(trainer.meta, f)
 
     @property
     def parameters(self) -> MetaDict:
@@ -406,66 +381,7 @@ class AcousticModel(Archive):
         params["final_silence_correction"] = self.meta.get("final_silence_correction", None)
         if "other_noise_phone" in self.meta:
             params["other_noise_phone"] = self.meta["other_noise_phone"]
-        # rules_path = self.dirname.joinpath("rules.yaml")
-        # if os.path.exists(rules_path):
-        #    params["rules_path"] = rules_path
-        if (
-            "dictionaries" in self.meta
-            and "position_dependent_phones" in self.meta["dictionaries"]
-        ):
-            params["position_dependent_phones"] = self.meta["dictionaries"][
-                "position_dependent_phones"
-            ]
-        else:
-            params["position_dependent_phones"] = self.meta.get("position_dependent_phones", True)
         return params
-
-    @property
-    def mfcc_options(self) -> MetaDict:
-        """Parameters to use in computing MFCC features."""
-        return {
-            "use-energy": self._meta["features"].get("use_energy", False),
-            "dither": self._meta["features"].get("dither", 1),
-            "energy-floor": self._meta["features"].get("energy_floor", 0),
-            "num-ceps": self._meta["features"].get("num_coefficients", 13),
-            "num-mel-bins": self._meta["features"].get("num_mel_bins", 23),
-            "cepstral-lifter": self._meta["features"].get("cepstral_lifter", 22),
-            "preemphasis-coefficient": self._meta["features"].get("preemphasis_coefficient", 0.97),
-            "frame-shift": self._meta["features"].get("frame_shift", 10),
-            "frame-length": self._meta["features"].get("frame_length", 25),
-            "low-freq": self._meta["features"].get("low_frequency", 20),
-            "high-freq": self._meta["features"].get("high_frequency", 7800),
-            "sample-frequency": self._meta["features"].get("sample_frequency", 16000),
-            "allow-downsample": self._meta["features"].get("allow_downsample", True),
-            "allow-upsample": self._meta["features"].get("allow_upsample", True),
-            "snip-edges": self._meta["features"].get("snip_edges", True),
-        }
-
-    @property
-    def pitch_options(self) -> MetaDict:
-        """Parameters to use in computing MFCC features."""
-        return {
-            "use-pitch": self._meta["features"].get("use_pitch", False),
-            "use-voicing": self._meta["features"].get("use_voicing", False),
-            "use-delta-pitch": self._meta["features"].get("use_delta_pitch", False),
-            "frame-shift": self._meta["features"].get("frame_shift", 10),
-            "frame-length": self._meta["features"].get("frame_length", 25),
-            "min-f0": self._meta["features"].get("min_f0", 50),
-            "max-f0": self._meta["features"].get("max_f0", 800),
-            "sample-frequency": self._meta["features"].get("sample_frequency", 16000),
-            "penalty-factor": self._meta["features"].get("penalty_factor", 0.1),
-            "delta-pitch": self._meta["features"].get("delta_pitch", 0.005),
-            "snip-edges": self._meta["features"].get("snip_edges", True),
-            "normalize": self._meta["features"].get("normalize_pitch", True),
-        }
-
-    @property
-    def lda_options(self) -> MetaDict:
-        """Parameters to use in computing MFCC features."""
-        return {
-            "splice_left_context": self._meta["features"].get("splice_left_context", 3),
-            "splice_right_context": self._meta["features"].get("splice_right_context", 3),
-        }
 
     @property
     def meta(self) -> MetaDict:
@@ -483,7 +399,6 @@ class AcousticModel(Archive):
             "allow_downsample": True,
             "allow_upsample": True,
             "use_pitch": False,
-            "use_voicing": False,
             "uses_cmvn": True,
             "uses_deltas": True,
             "uses_splices": False,
@@ -495,10 +410,10 @@ class AcousticModel(Archive):
             "splice_right_context": 3,
         }
         if not self._meta:
-            meta_path = self.dirname.joinpath("meta.json")
+            meta_path = os.path.join(self.dirname, "meta.json")
             format = "json"
             if not os.path.exists(meta_path):
-                meta_path = self.dirname.joinpath("meta.yaml")
+                meta_path = os.path.join(self.dirname, "meta.yaml")
                 format = "yaml"
             if not os.path.exists(meta_path):
                 self._meta = {
@@ -509,18 +424,13 @@ class AcousticModel(Archive):
             else:
                 with mfa_open(meta_path, "r") as f:
                     if format == "yaml":
-                        self._meta = yaml.load(f, Loader=yaml.Loader)
+                        self._meta = yaml.safe_load(f)
                     else:
                         self._meta = json.load(f)
                 if self._meta["features"] == "mfcc+deltas":
                     self._meta["features"] = default_features
                     if "pitch" in self._meta["features"]:
                         self._meta["features"]["use_pitch"] = self._meta["features"].pop("pitch")
-                if (
-                    self._meta["features"].get("use_pitch", False)
-                    and self._meta["version"] < "2.0.6"
-                ):
-                    self._meta["features"]["use_delta_pitch"] = True
             if "phone_type" not in self._meta:
                 self._meta["phone_type"] = "triphone"
             if "optional_silence_phone" not in self._meta:
@@ -537,7 +447,7 @@ class AcousticModel(Archive):
                 or not self._meta["features"]["uses_speaker_adaptation"]
             ):
                 self._meta["features"]["uses_speaker_adaptation"] = os.path.exists(
-                    self.dirname.joinpath("final.alimdl")
+                    os.path.join(self.dirname, "final.alimdl")
                 )
             if self._meta["version"] in {"0.9.0", "1.0.0"}:
                 self._meta["features"]["uses_speaker_adaptation"] = True
@@ -546,26 +456,10 @@ class AcousticModel(Archive):
                 or not self._meta["features"]["uses_splices"]
             ):
                 self._meta["features"]["uses_splices"] = os.path.exists(
-                    self.dirname.joinpath("lda.mat")
+                    os.path.join(self.dirname, "lda.mat")
                 )
                 if self._meta["features"]["uses_splices"]:
                     self._meta["features"]["uses_deltas"] = False
-            if (
-                self._meta["features"].get("use_pitch", False)
-                and "use_voicing" not in self._meta["features"]
-            ):
-                self._meta["features"]["use_voicing"] = True
-            if (
-                "dictionaries" in self._meta
-                and "position_dependent_phones" not in self._meta["dictionaries"]
-            ):
-                if self._meta["version"] < "2.0":
-                    default_value = True
-                else:
-                    default_value = False
-                self._meta["dictionaries"]["position_dependent_phones"] = self._meta.get(
-                    "position_dependent_phones", default_value
-                )
         self.parse_old_features()
         return self._meta
 
@@ -573,9 +467,17 @@ class AcousticModel(Archive):
         """
         Prints the metadata information to the terminal
         """
+        from .utils import get_mfa_version
 
-        configuration_data = {"Acoustic model": {"name": self.name, "data": {}}}
-        configuration_data["Acoustic model"]["data"]["Version"] = (self.meta["version"],)
+        printer = TerminalPrinter()
+        configuration_data = {"Acoustic model": {"name": (self.name, "green"), "data": {}}}
+        version_color = "green"
+        if self.meta["version"] != get_mfa_version():
+            version_color = "red"
+        configuration_data["Acoustic model"]["data"]["Version"] = (
+            self.meta["version"],
+            version_color,
+        )
 
         if "citation" in self.meta:
             configuration_data["Acoustic model"]["data"]["Citation"] = self.meta["citation"]
@@ -592,9 +494,9 @@ class AcousticModel(Archive):
         if self.meta["phones"]:
             configuration_data["Acoustic model"]["data"]["Phones"] = self.meta["phones"]
         else:
-            configuration_data["Acoustic model"]["data"]["Phones"] = "None found!"
+            configuration_data["Acoustic model"]["data"]["Phones"] = ("None found!", "red")
 
-        pprint(configuration_data)
+        printer.print_config(configuration_data)
 
     def add_model(self, source: str) -> None:
         """
@@ -607,10 +509,10 @@ class AcousticModel(Archive):
         """
         for f in self.files:
             if os.path.exists(os.path.join(source, f)):
-                copyfile(os.path.join(source, f), self.dirname.joinpath(f))
+                copyfile(os.path.join(source, f), os.path.join(self.dirname, f))
 
     def add_pronunciation_models(
-        self, source: Path, dictionary_base_names: Collection[str]
+        self, source: str, dictionary_base_names: Collection[str]
     ) -> None:
         """
         Add file into archive
@@ -623,11 +525,11 @@ class AcousticModel(Archive):
             Base names of dictionaries to add pronunciation models
         """
         for base_name in dictionary_base_names:
-            for f in [f"{base_name}.fst", f"{base_name}_align.fst"]:
-                if source.joinpath(f).exists():
-                    copyfile(source.joinpath(f), self.dirname.joinpath(f))
+            f = f"{base_name}.fst"
+            if os.path.exists(os.path.join(source, f)):
+                copyfile(os.path.join(source, f), os.path.join(self.dirname, f))
 
-    def export_model(self, destination: Path) -> None:
+    def export_model(self, destination: str) -> None:
         """
         Extract the model files to a new directory
 
@@ -636,23 +538,28 @@ class AcousticModel(Archive):
         destination: str
             Destination directory to extract files to
         """
-        destination.mkdir(parents=True, exist_ok=True)
+        os.makedirs(destination, exist_ok=True)
         for f in self.files:
-            if os.path.exists(self.dirname.joinpath(f)):
-                copyfile(self.dirname.joinpath(f), destination.joinpath(f))
+            if os.path.exists(os.path.join(self.dirname, f)):
+                copyfile(os.path.join(self.dirname, f), os.path.join(destination, f))
 
-    def log_details(self) -> None:
+    def log_details(self, logger: Logger) -> None:
         """
         Log metadata information to a logger
+
+        Parameters
+        ----------
+        logger: :class:`~logging.Logger`
+            Logger to send debug information to
         """
         logger.debug("")
         logger.debug("====ACOUSTIC MODEL INFO====")
-        logger.debug("Acoustic model root directory: " + str(self.root_directory))
-        logger.debug("Acoustic model dirname: " + str(self.dirname))
-        meta_path = self.dirname.joinpath("meta.json")
+        logger.debug("Acoustic model root directory: " + self.root_directory)
+        logger.debug("Acoustic model dirname: " + self.dirname)
+        meta_path = os.path.join(self.dirname, "meta.json")
         if not os.path.exists(meta_path):
-            meta_path = self.dirname.joinpath("meta.yaml")
-        logger.debug("Acoustic model meta path: " + str(meta_path))
+            meta_path = os.path.join(self.dirname, "meta.yaml")
+        logger.debug("Acoustic model meta path: " + meta_path)
         if not os.path.exists(meta_path):
             logger.debug("META.YAML DOES NOT EXIST, this may cause issues in validating the model")
         logger.debug("Acoustic model meta information:")
@@ -679,8 +586,7 @@ class AcousticModel(Archive):
             missing_phones = dictionary.meta["phones"] - set(self.meta["phones"])
         else:
             missing_phones = dictionary.non_silence_phones - set(self.meta["phones"])
-        missing_phones -= {"sp", "<eps>"}
-        if missing_phones:  # Compatibility
+        if missing_phones and missing_phones != {"sp"}:  # Compatibility
             raise (PronunciationAcousticMismatchError(missing_phones))
 
 
@@ -695,21 +601,13 @@ class IvectorExtractorModel(Archive):
         "final.ie",
         "final.ubm",
         "final.dubm",
-        "ivector_lda.mat",
         "plda",
-        "num_utts.ark",
-        "speaker_ivectors.ark",
+        "mean.vec",
+        "trans.mat",
     ]
-    extensions = [
-        ".ivector",
-        ".zip",
-    ]
+    extensions = [".zip", ".ivector"]
 
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
+    def __init__(self, source: str, root_directory: Optional[str] = None):
         if source in IvectorExtractorModel.get_available_models():
             source = IvectorExtractorModel.get_pretrained_path(source)
 
@@ -734,7 +632,7 @@ class IvectorExtractorModel(Archive):
         """
         for filename in self.model_files:
             if os.path.exists(os.path.join(source, filename)):
-                copyfile(os.path.join(source, filename), self.dirname.joinpath(filename))
+                copyfile(os.path.join(source, filename), os.path.join(self.dirname, filename))
 
     def export_model(self, destination: str) -> None:
         """
@@ -747,8 +645,8 @@ class IvectorExtractorModel(Archive):
         """
         os.makedirs(destination, exist_ok=True)
         for filename in self.model_files:
-            if os.path.exists(self.dirname.joinpath(filename)):
-                copyfile(self.dirname.joinpath(filename), os.path.join(destination, filename))
+            if os.path.exists(os.path.join(self.dirname, filename)):
+                copyfile(os.path.join(self.dirname, filename), os.path.join(destination, filename))
 
 
 class G2PModel(Archive):
@@ -767,11 +665,7 @@ class G2PModel(Archive):
 
     model_type = "g2p"
 
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
+    def __init__(self, source: str, root_directory: Optional[str] = None):
         if source in G2PModel.get_available_models():
             source = G2PModel.get_pretrained_path(source)
 
@@ -787,17 +681,17 @@ class G2PModel(Archive):
             Trainer for the G2P model
         """
 
-        with mfa_open(self.dirname.joinpath("meta.json"), "w") as f:
+        with mfa_open(os.path.join(self.dirname, "meta.json"), "w") as f:
             json.dump(g2p_trainer.meta, f, cls=EnhancedJSONEncoder)
 
     @property
     def meta(self) -> dict:
         """Metadata for the G2P model"""
         if not self._meta:
-            meta_path = self.dirname.joinpath("meta.json")
+            meta_path = os.path.join(self.dirname, "meta.json")
             format = "json"
             if not os.path.exists(meta_path):
-                meta_path = self.dirname.joinpath("meta.yaml")
+                meta_path = os.path.join(self.dirname, "meta.yaml")
                 format = "yaml"
             if not os.path.exists(meta_path):
                 self._meta = {"version": "0.9.0", "architecture": "phonetisaurus"}
@@ -806,7 +700,7 @@ class G2PModel(Archive):
                     if format == "json":
                         self._meta = json.load(f)
                     else:
-                        self._meta = yaml.load(f, Loader=yaml.Loader)
+                        self._meta = yaml.safe_load(f)
             self._meta["phones"] = set(self._meta.get("phones", []))
             self._meta["graphemes"] = set(self._meta.get("graphemes", []))
             self._meta["evaluation"] = self._meta.get("evaluation", [])
@@ -814,27 +708,27 @@ class G2PModel(Archive):
         return self._meta
 
     @property
-    def fst_path(self) -> Path:
+    def fst_path(self) -> str:
         """G2P model's FST path"""
-        return self.dirname.joinpath("model.fst")
+        return os.path.join(self.dirname, "model.fst")
 
     @property
-    def sym_path(self) -> Path:
+    def sym_path(self) -> str:
         """G2P model's symbols path"""
-        path = self.dirname.joinpath("phones.txt")
-        if path.exists():
+        path = os.path.join(self.dirname, "phones.txt")
+        if os.path.exists(path):
             return path
-        return self.dirname.joinpath("phones.sym")
+        return os.path.join(self.dirname, "phones.sym")
 
     @property
-    def grapheme_sym_path(self) -> Path:
+    def grapheme_sym_path(self) -> str:
         """G2P model's grapheme symbols path"""
-        path = self.dirname.joinpath("graphemes.txt")
-        if path.exists():
+        path = os.path.join(self.dirname, "graphemes.txt")
+        if os.path.exists(path):
             return path
-        return self.dirname.joinpath("graphemes.sym")
+        return os.path.join(self.dirname, "graphemes.sym")
 
-    def add_sym_path(self, source_directory: Path) -> None:
+    def add_sym_path(self, source_directory: str) -> None:
         """
         Add symbols file into archive
 
@@ -850,7 +744,7 @@ class G2PModel(Archive):
         ):
             copyfile(os.path.join(source_directory, "graphemes.txt"), self.grapheme_sym_path)
 
-    def add_fst_model(self, source_directory: Path) -> None:
+    def add_fst_model(self, source_directory: str) -> None:
         """
         Add FST file into archive
 
@@ -859,7 +753,7 @@ class G2PModel(Archive):
         source_directory: str
             Source directory path
         """
-        if not self.fst_path.exists():
+        if not os.path.exists(self.fst_path):
             copyfile(os.path.join(source_directory, "model.fst"), self.fst_path)
 
     def export_fst_model(self, destination: str) -> None:
@@ -898,143 +792,6 @@ class G2PModel(Archive):
             return True
 
 
-class TokenizerModel(Archive):
-    """
-    Class for Tokenizer models
-
-    Parameters
-    ----------
-    source: str
-        Path to source archive
-    root_directory: str
-        Path to save exported model
-    """
-
-    extensions = [".zip", ".tkn"]
-
-    model_type = "tokenizer"
-
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
-        if source in TokenizerModel.get_available_models():
-            source = TokenizerModel.get_pretrained_path(source)
-
-        super().__init__(source, root_directory)
-
-    def add_meta_file(self, g2p_trainer: TokenizerTrainer) -> None:
-        """
-        Construct metadata information for the G2P model from the dictionary it was trained from
-
-        Parameters
-        ----------
-        g2p_trainer: :class:`~montreal_forced_aligner.g2p.trainer.G2PTrainer`
-            Trainer for the G2P model
-        """
-
-        with mfa_open(self.dirname.joinpath("meta.json"), "w") as f:
-            json.dump(g2p_trainer.meta, f, cls=EnhancedJSONEncoder)
-
-    @property
-    def meta(self) -> dict:
-        """Metadata for the G2P model"""
-        if not self._meta:
-            meta_path = self.dirname.joinpath("meta.json")
-            format = "json"
-            if not os.path.exists(meta_path):
-                meta_path = self.dirname.joinpath("meta.yaml")
-                format = "yaml"
-            if not os.path.exists(meta_path):
-                self._meta = {"version": "0.9.0", "architecture": "pynini"}
-            else:
-                with mfa_open(meta_path, "r") as f:
-                    if format == "json":
-                        self._meta = json.load(f)
-                    else:
-                        self._meta = yaml.load(f, Loader=yaml.Loader)
-            self._meta["evaluation"] = self._meta.get("evaluation", [])
-            self._meta["training"] = self._meta.get("training", [])
-        return self._meta
-
-    @property
-    def fst_path(self) -> Path:
-        """Tokenizer model's FST path"""
-        return self.dirname.joinpath("tokenizer.fst")
-
-    @property
-    def sym_path(self) -> Path:
-        """Tokenizer model's grapheme symbols path"""
-        path = self.dirname.joinpath("graphemes.txt")
-        if path.exists():
-            return path
-        path = self.dirname.joinpath("graphemes.sym")
-        if path.exists():
-            return path
-        return self.dirname.joinpath("graphemes.syms")
-
-    @property
-    def input_sym_path(self) -> Path:
-        """Tokenizer model's input symbols path"""
-        path = self.dirname.joinpath("input.txt")
-        if path.exists():
-            return path
-        return self.dirname.joinpath("input.syms")
-
-    @property
-    def output_sym_path(self) -> Path:
-        """Tokenizer model's output symbols path"""
-        path = self.dirname.joinpath("output.txt")
-        if path.exists():
-            return path
-        return self.dirname.joinpath("output.syms")
-
-    def add_graphemes_path(self, source_directory: Path) -> None:
-        """
-        Add symbols file into archive
-
-        Parameters
-        ----------
-        source_directory: :class:`~pathlib.Path`
-            Source directory path
-        """
-        for p in [self.sym_path, self.output_sym_path, self.input_sym_path]:
-            source_p = source_directory.joinpath(p.name)
-            if not p.exists() and source_p.exists():
-                copyfile(source_p, p)
-
-    def add_tokenizer_model(self, source_directory: Path) -> None:
-        """
-        Add FST file into archive
-
-        Parameters
-        ----------
-        source_directory: :class:`~pathlib.Path`
-            Source directory path
-        """
-        if not self.fst_path.exists():
-            copyfile(source_directory.joinpath("tokenizer.fst"), self.fst_path)
-
-    def export_fst_model(self, destination: Path) -> None:
-        """
-        Extract FST model path to destination
-
-        Parameters
-        ----------
-        destination: :class:`~pathlib.Path`
-            Destination directory
-        """
-        destination.mkdir(parents=True, exist_ok=True)
-        copy(self.fst_path, destination)
-
-    def validate(self, *args) -> None:
-        """
-        Placeholder
-        """
-        pass
-
-
 class LanguageModel(Archive):
     """
     Class for MFA language models
@@ -1052,29 +809,21 @@ class LanguageModel(Archive):
     arpa_extension = ".arpa"
     extensions = [f".{FORMAT}", arpa_extension, ".lm"]
 
-    def __init__(
-        self,
-        source: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
-    ):
+    def __init__(self, source: str, root_directory: Optional[str] = None):
         if source in LanguageModel.get_available_models():
             source = LanguageModel.get_pretrained_path(source)
         from .config import get_temporary_directory
 
-        if isinstance(source, str):
-            source = Path(source)
         if root_directory is None:
-            root_directory = get_temporary_directory().joinpath(
-                "extracted_models", self.model_type
+            root_directory = os.path.join(
+                get_temporary_directory(), "extracted_models", self.model_type
             )
-        if isinstance(root_directory, str):
-            source = Path(root_directory)
 
-        if source.suffix == self.arpa_extension:
+        if source.endswith(self.arpa_extension):
             self.root_directory = root_directory
             self._meta = {}
-            self.name = source.stem
-            self.dirname = root_directory.joinpath(f"{self.name}_{self.model_type}")
+            self.name, _ = os.path.splitext(os.path.basename(source))
+            self.dirname = os.path.join(root_directory, f"{self.name}_{self.model_type}")
             if not os.path.exists(self.dirname):
                 os.makedirs(self.dirname, exist_ok=True)
             copy(source, self.large_arpa_path)
@@ -1104,44 +853,40 @@ class LanguageModel(Archive):
     @property
     def small_arpa_path(self) -> str:
         """Small arpa path"""
-        for path in self.dirname.iterdir():
-            if path.name.endswith("_small" + self.arpa_extension):
-                return path
-        return self.dirname.joinpath(f"{self.name}_small{self.arpa_extension}")
+        for file in os.listdir(self.dirname):
+            if file.endswith("_small" + self.arpa_extension):
+                return os.path.join(self.dirname, file)
+        return os.path.join(self.dirname, f"{self.name}_small{self.arpa_extension}")
 
     @property
     def medium_arpa_path(self) -> str:
         """Medium arpa path"""
-        for path in self.dirname.iterdir():
-            if path.name.endswith("_med" + self.arpa_extension):
-                return path
-        return self.dirname.joinpath(f"{self.name}_med{self.arpa_extension}")
+        for file in os.listdir(self.dirname):
+            if file.endswith("_med" + self.arpa_extension):
+                return os.path.join(self.dirname, file)
+        return os.path.join(self.dirname, f"{self.name}_med{self.arpa_extension}")
 
     @property
     def large_arpa_path(self) -> str:
         """Large arpa path"""
-        for path in self.dirname.iterdir():
-            if (
-                path.name.endswith(self.arpa_extension)
-                and "_small" not in path.name
-                and "_med" not in path.name
-            ):
-                return path
-        return self.dirname.joinpath(self.name + self.arpa_extension)
+        for file in os.listdir(self.dirname):
+            if file.endswith(self.arpa_extension) and "_small" not in file and "_med" not in file:
+                return os.path.join(self.dirname, file)
+        return os.path.join(self.dirname, self.name + self.arpa_extension)
 
-    def add_arpa_file(self, arpa_path: Path) -> None:
+    def add_arpa_file(self, arpa_path: str) -> None:
         """
         Adds an ARPA file to the model
 
         Parameters
         ----------
-        arpa_path: :class:`~pathlib.Path`
+        arpa_path: str
             Path to ARPA file
         """
         output_name = self.large_arpa_path
-        if arpa_path.name.endswith("_small.arpa"):
+        if arpa_path.endswith("_small.arpa"):
             output_name = self.small_arpa_path
-        elif arpa_path.name.endswith("_medium.arpa"):
+        elif arpa_path.endswith("_medium.arpa"):
             output_name = self.medium_arpa_path
         copyfile(arpa_path, output_name)
 
@@ -1152,9 +897,9 @@ class DictionaryModel(MfaModel):
 
     Parameters
     ----------
-    path: :class:`~pathlib.Path`
+    path: str
         Path to the dictionary file
-    root_directory: :class:`~pathlib.Path`, optional
+    root_directory: str, optional
         Path to working directory (currently not needed, but present to maintain consistency with other MFA Models
     """
 
@@ -1164,24 +909,21 @@ class DictionaryModel(MfaModel):
 
     def __init__(
         self,
-        path: typing.Union[str, Path],
-        root_directory: Optional[typing.Union[str, Path]] = None,
+        path: str,
+        root_directory: Optional[str] = None,
         phone_set_type: typing.Union[str, PhoneSetType] = "UNKNOWN",
     ):
         if path in DictionaryModel.get_available_models():
             path = DictionaryModel.get_pretrained_path(path)
-        if isinstance(path, str):
-            path = Path(path)
+
         if root_directory is None:
             from montreal_forced_aligner.config import get_temporary_directory
 
-            root_directory = get_temporary_directory().joinpath(
-                "extracted_models", self.model_type
+            root_directory = os.path.join(
+                get_temporary_directory(), "extracted_models", self.model_type
             )
-        if isinstance(root_directory, str):
-            root_directory = Path(root_directory)
         self.path = path
-        self.dirname = root_directory.joinpath(f"{self.name}_{self.model_type}")
+        self.dirname = os.path.join(root_directory, f"{self.name}_{self.model_type}")
         self.pronunciation_probabilities = True
         self.silence_probabilities = True
         self.oov_probabilities = True
@@ -1271,15 +1013,18 @@ class DictionaryModel(MfaModel):
 
     def pretty_print(self) -> None:
         """
-        Pretty print the dictionary's metadata
+        Pretty print the dictionary's metadata using TerminalPrinter
         """
         from montreal_forced_aligner.dictionary.multispeaker import MultispeakerDictionary
 
-        configuration_data = {"Dictionary": {"name": self.name, "data": self.meta}}
-        temp_directory = self.dirname.joinpath("temp")
-        if temp_directory.exists():
+        printer = TerminalPrinter()
+        configuration_data = {"Dictionary": {"name": (self.name, "green"), "data": self.meta}}
+        temp_directory = os.path.join(self.dirname, "temp")
+        if os.path.exists(temp_directory):
             shutil.rmtree(temp_directory)
-        dictionary = MultispeakerDictionary(self.path, phone_set_type=self.phone_set_type)
+        dictionary = MultispeakerDictionary(
+            self.path, temporary_directory=temp_directory, phone_set_type=self.phone_set_type
+        )
         graphemes, phone_counts = dictionary.dictionary_setup()
         configuration_data["Dictionary"]["data"]["phones"] = sorted(dictionary.non_silence_phones)
         configuration_data["Dictionary"]["data"]["detailed_phone_info"] = {}
@@ -1303,16 +1048,16 @@ class DictionaryModel(MfaModel):
             configuration_data["Dictionary"]["data"]["graphemes"] = sorted(graphemes)
         else:
             configuration_data["Dictionary"]["data"]["graphemes"] = f"{len(graphemes)} graphemes"
-        pprint(configuration_data)
+        printer.print_config(configuration_data)
 
     @classmethod
-    def valid_extension(cls, filename: Path) -> bool:
+    def valid_extension(cls, filename: str) -> bool:
         """
         Check whether a file has a valid extension for the given model archive
 
         Parameters
         ----------
-        filename: :class:`~pathlib.Path`
+        filename: str
             File name to check
 
         Returns
@@ -1320,20 +1065,18 @@ class DictionaryModel(MfaModel):
         bool
             True if the extension matches the models allowed extensions
         """
-        if filename.suffix in cls.extensions:
+        if os.path.splitext(filename)[1] in cls.extensions:
             return True
         return False
 
     @classmethod
-    def generate_path(
-        cls, root: Path, name: str, enforce_existence: bool = True
-    ) -> Optional[Path]:
+    def generate_path(cls, root: str, name: str, enforce_existence: bool = True) -> Optional[str]:
         """
         Generate a path for a given model from the root directory and the name of the model
 
         Parameters
         ----------
-        root: :class:`~pathlib.Path`
+        root: str
             Root directory for the full path
         name: str
             Name of the model
@@ -1342,26 +1085,26 @@ class DictionaryModel(MfaModel):
 
         Returns
         -------
-        Path
+        str
            Full path in the root directory for the model
         """
         for ext in cls.extensions:
-            path = root.joinpath(name + ext)
-            if path.exists() or not enforce_existence:
+            path = os.path.join(root, name + ext)
+            if os.path.exists(path) or not enforce_existence:
                 return path
         return None
 
     @property
     def is_multiple(self) -> bool:
         """Flag for whether the dictionary contains multiple lexicons"""
-        return self.path.suffix in [".yaml", ".yml"]
+        return os.path.splitext(self.path)[1] in [".yaml", ".yml"]
 
     @property
     def name(self) -> str:
         """Name of the dictionary"""
-        return self.path.stem
+        return os.path.splitext(os.path.basename(self.path))[0]
 
-    def load_dictionary_paths(self) -> Dict[str, Tuple[DictionaryModel, typing.Set[str]]]:
+    def load_dictionary_paths(self) -> Dict[str, Tuple[DictionaryModel, List[str]]]:
         """
         Load the pronunciation dictionaries
 
@@ -1373,13 +1116,13 @@ class DictionaryModel(MfaModel):
         mapping = {}
         if self.is_multiple:
             with mfa_open(self.path, "r") as f:
-                data = yaml.load(f, Loader=yaml.Loader)
+                data = yaml.safe_load(f)
                 for speaker, path in data.items():
                     if path not in mapping:
                         mapping[path] = (DictionaryModel(path), set())
                     mapping[path][1].add(speaker)
         else:
-            mapping[str(self.path)] = (self, {"default"})
+            mapping[self.path] = (self, {"default"})
         return mapping
 
 
@@ -1389,7 +1132,6 @@ MODEL_TYPES = {
     "dictionary": DictionaryModel,
     "language_model": LanguageModel,
     "ivector": IvectorExtractorModel,
-    "tokenizer": TokenizerModel,
 }
 
 
@@ -1444,38 +1186,38 @@ class ModelManager:
     def __init__(self, token=None):
         from montreal_forced_aligner.config import get_temporary_directory
 
-        pretrained_dir = get_temporary_directory().joinpath("pretrained_models")
-        pretrained_dir.mkdir(parents=True, exist_ok=True)
+        pretrained_dir = os.path.join(get_temporary_directory(), "pretrained_models")
+        os.makedirs(pretrained_dir, exist_ok=True)
         self.local_models = {k: [] for k in MODEL_TYPES.keys()}
         self.remote_models: Dict[str, Dict[str, ModelRelease]] = {
             k: {} for k in MODEL_TYPES.keys()
         }
         self.token = token
-        environment_token = os.environ.get("GITHUB_TOKEN", None)
-        if self.token is not None:
-            self.token = environment_token
         self.synced_remote = False
+        self.printer = TerminalPrinter()
+
+        self.logger = configure_logger("models")
         self._cache_info = {}
         self.refresh_local()
 
     @property
-    def cache_path(self) -> Path:
+    def cache_path(self) -> str:
         """Path to json file with cached etags and download links"""
         from montreal_forced_aligner.config import get_temporary_directory
 
-        return get_temporary_directory().joinpath("pretrained_models", "cache.json")
+        pretrained_dir = os.path.join(get_temporary_directory(), "pretrained_models")
+        return os.path.join(pretrained_dir, "cache.json")
 
     def reset_local(self) -> None:
         """Reset cached models"""
         from montreal_forced_aligner.config import get_temporary_directory
 
-        pretrained_dir = get_temporary_directory().joinpath("pretrained_models")
-        if pretrained_dir.exists():
-            shutil.rmtree(pretrained_dir, ignore_errors=True)
+        pretrained_dir = os.path.join(get_temporary_directory(), "pretrained_models")
+        shutil.rmtree(pretrained_dir, ignore_errors=True)
 
     def refresh_local(self) -> None:
         """Refresh cached information with the latest list of local model"""
-        if self.cache_path.exists():
+        if os.path.exists(self.cache_path):
             with mfa_open(self.cache_path, "r") as f:
                 self._cache_info = json.load(f)
                 if "list_etags" in self._cache_info:
@@ -1494,8 +1236,6 @@ class ModelManager:
         headers = {"Accept": "application/vnd.github.v3+json"}
         if self.token:
             headers["Authorization"] = f"token {self.token}"
-        else:
-            logger.debug("No Github Token supplied")
         page = 1
         etags = {}
         if "list_etags" in self._cache_info:
@@ -1552,8 +1292,7 @@ class ModelManager:
                 ]
             page += 1
         with mfa_open(self.cache_path, "w") as f:
-            json.dump(self._cache_info, f, ensure_ascii=False)
-        self.synced_remote = True
+            json.dump(self._cache_info, f)
 
     def has_local_model(self, model_type: str, model_name: str) -> bool:
         """Check for local model"""
@@ -1570,19 +1309,28 @@ class ModelManager:
         """
         self.refresh_local()
         if model_type is None:
-            logger.info("Available local models")
-            data = {}
+            self.printer.print_information_line("Available local models", "", level=0)
             for model_type, model_class in MODEL_TYPES.items():
-                data[model_type] = model_class.get_available_models()
-            pprint(data)
+                names = model_class.get_available_models()
+                if names:
+                    self.printer.print_information_line(model_type, names, value_color="green")
+                else:
+                    self.printer.print_information_line(
+                        model_type, "No models found", value_color="yellow"
+                    )
         else:
-            logger.info(f"Available local {model_type} models")
+            self.printer.print_information_line(
+                f"Available local {model_type} models", "", level=0
+            )
             model_class = MODEL_TYPES[model_type]
             names = model_class.get_available_models()
             if names:
-                pprint(names)
+                for name in names:
+                    self.printer.print_information_line("", name, value_color="green", level=1)
             else:
-                logger.error("No models found")
+                self.printer.print_information_line(
+                    "", "No models found", value_color="yellow", level=1
+                )
 
     def print_remote_models(self, model_type: typing.Optional[str] = None) -> None:
         """
@@ -1596,18 +1344,27 @@ class ModelManager:
         if not self.synced_remote:
             self.refresh_remote()
         if model_type is None:
-            logger.info("Available models for download")
-            data = {}
+            self.printer.print_information_line("Available models for download", "", level=0)
             for model_type, release_data in self.remote_models.items():
-                data[model_type] = sorted(release_data.keys())
-            pprint(data)
+                names = sorted(release_data.keys())
+                if names:
+                    self.printer.print_information_line(model_type, names, value_color="green")
+                else:
+                    self.printer.print_information_line(
+                        model_type, "No models found", value_color="red"
+                    )
         else:
-            logger.info(f"Available {model_type} models for download")
+            self.printer.print_information_line(
+                f"Available {model_type} models for download", "", level=0
+            )
             names = sorted(self.remote_models[model_type].keys())
             if names:
-                pprint(names)
+                for name in names:
+                    self.printer.print_information_line("", name, value_color="green", level=1)
             else:
-                logger.error("No models found")
+                self.printer.print_information_line(
+                    "", "No models found", value_color="yellow", level=1
+                )
 
     def download_model(
         self, model_type: str, model_name=typing.Optional[str], ignore_cache=False
@@ -1629,14 +1386,14 @@ class ModelManager:
         if not self.synced_remote:
             self.refresh_remote()
         if model_name not in self.remote_models[model_type]:
-            raise RemoteModelNotFoundError(
+            raise PretrainedModelNotFoundError(
                 model_name, model_type, sorted(self.remote_models[model_type].keys())
             )
         release = self.remote_models[model_type][model_name]
-        local_path = (
-            MODEL_TYPES[model_type].pretrained_directory().joinpath(release.download_file_name)
+        local_path = os.path.join(
+            MODEL_TYPES[model_type].pretrained_directory(), release.download_file_name
         )
-        if local_path.exists() and not ignore_cache:
+        if os.path.exists(local_path) and not ignore_cache:
             return
         headers = {"Accept": "application/octet-stream"}
         if self.token:
@@ -1650,6 +1407,6 @@ class ModelManager:
         with mfa_open(local_path, "wb") as f:
             f.write(r.content)
         self.refresh_local()
-        logger.info(
-            f"Saved model to {local_path}, you can now use {model_name} in place of {model_type} paths in mfa commands."
+        self.logger.info(
+            f"Saved model to f{local_path}, you can now use {model_name} in place of {model_type} paths in mfa commands."
         )

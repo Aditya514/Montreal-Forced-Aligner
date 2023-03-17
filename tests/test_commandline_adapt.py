@@ -1,8 +1,7 @@
 import os
 
-import click.testing
-
-from montreal_forced_aligner.command_line.mfa import mfa_cli
+from montreal_forced_aligner.command_line.adapt import run_adapt_model
+from montreal_forced_aligner.command_line.mfa import parser
 
 
 def test_adapt_basic(
@@ -12,9 +11,8 @@ def test_adapt_basic(
     temp_dir,
     test_align_config,
     english_acoustic_model,
-    db_setup,
 ):
-    adapted_model_path = generated_dir.joinpath("basic_adapted.zip")
+    adapted_model_path = os.path.join(generated_dir, "basic_adapted.zip")
     command = [
         "adapt",
         basic_corpus_dir,
@@ -22,24 +20,18 @@ def test_adapt_basic(
         english_acoustic_model,
         adapted_model_path,
         "--beam",
-        "15",
+        "100",
+        "-t",
+        temp_dir,
         "--clean",
-        "--no_debug",
-        "-p",
-        "test",
+        "--debug",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
+    args, unknown = parser.parse_known_args(command)
+    run_adapt_model(args, unknown)
     assert os.path.exists(adapted_model_path)
 
 
+# @pytest.mark.skip(reason='Optimization')
 def test_adapt_multilingual(
     multilingual_ipa_corpus_dir,
     mfa_speaker_dict_path,
@@ -48,10 +40,9 @@ def test_adapt_multilingual(
     basic_align_config_path,
     english_acoustic_model,
     english_mfa_acoustic_model,
-    db_setup,
 ):
-    adapted_model_path = generated_dir.joinpath("multilingual_adapted.zip")
-    output_path = generated_dir.joinpath("multilingual_output")
+    adapted_model_path = os.path.join(generated_dir, "multilingual_adapted.zip")
+    output_path = os.path.join(generated_dir, "multilingual_output")
     command = [
         "adapt",
         multilingual_ipa_corpus_dir,
@@ -59,21 +50,14 @@ def test_adapt_multilingual(
         english_mfa_acoustic_model,
         adapted_model_path,
         output_path,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
-        "--no_debug",
-        "-p",
-        "test",
+        "--debug",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
+    args, unknown = parser.parse_known_args(command)
+    run_adapt_model(args, unknown)
     assert os.path.exists(adapted_model_path)

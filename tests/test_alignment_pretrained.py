@@ -2,25 +2,20 @@ import os
 import shutil
 
 from montreal_forced_aligner.alignment import PretrainedAligner
-from montreal_forced_aligner.db import PhoneInterval, Utterance, WordInterval, WorkflowType
+from montreal_forced_aligner.db import PhoneInterval, Utterance, WordInterval
 
 
 def test_align_sick(
-    english_dictionary,
-    english_acoustic_model,
-    basic_corpus_dir,
-    temp_dir,
-    test_align_config,
-    db_setup,
+    english_dictionary, english_acoustic_model, basic_corpus_dir, temp_dir, test_align_config
 ):
-    temp_dir = os.path.join(temp_dir, "align_corpus_cli")
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    temp = os.path.join(temp_dir, "align_export_temp")
     a = PretrainedAligner(
         corpus_directory=basic_corpus_dir,
         dictionary_path=english_dictionary,
         acoustic_model_path=english_acoustic_model,
-        oov_count_threshold=1,
-        temporary_directory=temp_dir,
+        temporary_directory=temp,
+        debug=True,
+        verbose=True,
         **test_align_config
     )
     a.align()
@@ -29,16 +24,10 @@ def test_align_sick(
     assert "AY_S" in a.phone_mapping
     a.export_files(export_directory)
     assert os.path.exists(os.path.join(export_directory, "michael", "acoustic_corpus.TextGrid"))
-    a.clean_working_directory()
 
 
 def test_align_one(
-    english_dictionary,
-    english_acoustic_model,
-    basic_corpus_dir,
-    temp_dir,
-    test_align_config,
-    db_setup,
+    english_dictionary, english_acoustic_model, basic_corpus_dir, temp_dir, test_align_config
 ):
     temp = os.path.join(temp_dir, "align_one_temp")
     a = PretrainedAligner(
@@ -51,18 +40,16 @@ def test_align_one(
         clean=True,
         **test_align_config
     )
-    a.initialize_database()
-    a.create_new_current_workflow(WorkflowType.online_alignment)
     a.setup()
     with a.session() as session:
-        utterance = session.get(Utterance, 3)
+        utterance = session.query(Utterance).first()
         assert utterance.alignment_log_likelihood is None
         assert utterance.features is not None
         assert len(utterance.phone_intervals) == 0
         a.align_one_utterance(utterance, session)
 
     with a.session() as session:
-        utterance = session.get(Utterance, 3)
+        utterance = session.query(Utterance).first()
         assert utterance.alignment_log_likelihood is not None
         assert len(utterance.phone_intervals) > 0
 
@@ -73,15 +60,14 @@ def test_align_one(
         session.commit()
 
     with a.session() as session:
-        utterance = session.get(Utterance, 3)
+        utterance = session.query(Utterance).first()
         assert utterance.alignment_log_likelihood is None
         assert utterance.features is None
         assert len(utterance.phone_intervals) == 0
         a.align_one_utterance(utterance, session)
 
     with a.session() as session:
-        utterance = session.get(Utterance, 3)
+        utterance = session.query(Utterance).first()
         assert utterance.alignment_log_likelihood is not None
         assert utterance.features is None
         assert len(utterance.phone_intervals) > 0
-    a.clean_working_directory()

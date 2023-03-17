@@ -5,24 +5,23 @@ import logging
 import multiprocessing as mp
 import os
 import re
+import shutil
 import subprocess
 import time
 from abc import abstractmethod
-from pathlib import Path
 from queue import Empty
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Dict, List
 
 import sqlalchemy.engine
+import tqdm
 from sqlalchemy.orm import Session
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner.abc import MfaWorker, ModelExporterMixin, TrainerMixin
 from montreal_forced_aligner.alignment import AlignMixin
 from montreal_forced_aligner.alignment.multiprocessing import AccStatsArguments, AccStatsFunction
-from montreal_forced_aligner.config import GLOBAL_CONFIG
 from montreal_forced_aligner.corpus.acoustic_corpus import AcousticCorpusPronunciationMixin
 from montreal_forced_aligner.corpus.features import FeatureConfigMixin
-from montreal_forced_aligner.db import CorpusWorkflow, Utterance
+from montreal_forced_aligner.db import Utterance
 from montreal_forced_aligner.exceptions import KaldiProcessingError
 from montreal_forced_aligner.helper import mfa_open
 from montreal_forced_aligner.models import AcousticModel
@@ -40,9 +39,6 @@ if TYPE_CHECKING:
 
 
 __all__ = ["AcousticModelTrainingMixin"]
-
-
-logger = logging.getLogger("mfa")
 
 
 class AcousticModelTrainingMixin(
@@ -119,9 +115,9 @@ class AcousticModelTrainingMixin(
         self.final_gaussian_iteration = 0  # Gets set later
 
     @property
-    def db_string(self) -> str:
-        """Root worker's database connection string"""
-        return self.worker.db_string
+    def db_path(self) -> str:
+        """Root worker's path to database file"""
+        return self.worker.db_path
 
     def acc_stats_arguments(self) -> List[AccStatsArguments]:
         """
@@ -132,35 +128,21 @@ class AcousticModelTrainingMixin(
         list[:class:`~montreal_forced_aligner.alignment.multiprocessing.AccStatsArguments`]
             Arguments for processing
         """
-        arguments = []
-        for j in self.jobs:
-            feat_strings = {}
-            for d_id in j.dictionary_ids:
-                feat_strings[d_id] = j.construct_feature_proc_string(
-                    self.working_directory,
-                    d_id,
-                    self.feature_options["uses_splices"],
-                    self.feature_options["splice_left_context"],
-                    self.feature_options["splice_right_context"],
-                    self.feature_options["uses_speaker_adaptation"],
-                )
-            arguments.append(
-                AccStatsArguments(
-                    j.id,
-                    self.db_string,
-                    os.path.join(
-                        self.working_directory, "log", f"acc.{self.iteration}.{j.id}.log"
-                    ),
-                    j.dictionary_ids,
-                    feat_strings,
-                    j.construct_path_dictionary(self.working_directory, "ali", "ark"),
-                    j.construct_path_dictionary(
-                        self.working_directory, str(self.iteration), "acc"
-                    ),
-                    self.model_path,
-                )
+        feat_strings = self.worker.construct_feature_proc_strings()
+        return [
+            AccStatsArguments(
+                j.name,
+                self.db_path,
+                os.path.join(self.working_directory, "log", f"acc.{self.iteration}.{j.name}.log"),
+                j.dictionary_ids,
+                feat_strings[j.name],
+                j.construct_path_dictionary(self.working_directory, "ali", "ark"),
+                j.construct_path_dictionary(self.working_directory, str(self.iteration), "acc"),
+                self.model_path,
             )
-        return arguments
+            for j in self.jobs
+            if j.has_data
+        ]
 
     @property
     def previous_aligner(self) -> AcousticCorpusPronunciationMixin:
@@ -183,6 +165,50 @@ class AcousticModelTrainingMixin(
         """
         return self.worker.utterances(session)
 
+    def log_debug(self, message: str = "") -> None:
+        """
+        Log a debug message. This function is a wrapper around the worker's :meth:`logging.Logger.debug`
+
+        Parameters
+        ----------
+        message: str
+            Debug message to log
+        """
+        self.worker.log_debug(message)
+
+    def log_error(self, message: str = "") -> None:
+        """
+        Log an info message. This function is a wrapper around the worker's :meth:`logging.Logger.info`
+
+        Parameters
+        ----------
+        message: str
+            Info message to log
+        """
+        self.worker.log_error(message)
+
+    def log_warning(self, message: str = "") -> None:
+        """
+        Log a warning message. This function is a wrapper around the worker's :meth:`logging.Logger.warning`
+
+        Parameters
+        ----------
+        message: str
+            Warning message to log
+        """
+        self.worker.log_warning(message)
+
+    def log_info(self, message: str = "") -> None:
+        """
+        Log an error message. This function is a wrapper around the worker's :meth:`logging.Logger.error`
+
+        Parameters
+        ----------
+        message: str
+            Error message to log
+        """
+        self.worker.log_info(message)
+
     @property
     def jobs(self) -> List[Job]:
         """Top-level worker's job objects"""
@@ -196,6 +222,16 @@ class AcousticModelTrainingMixin(
     def session(self, **kwargs) -> sqlalchemy.orm.session.Session:
         """Top-level worker's database session"""
         return self.worker.session(**kwargs)
+
+    def construct_feature_proc_strings(
+        self, speaker_independent: bool = False
+    ) -> List[Dict[str, str]]:
+        """Top-level worker's feature strings"""
+        return self.worker.construct_feature_proc_strings(speaker_independent)
+
+    def construct_base_feature_string(self, all_feats: bool = False) -> str:
+        """Top-level worker's base feature string"""
+        return self.worker.construct_base_feature_string(all_feats)
 
     @property
     def data_directory(self) -> str:
@@ -214,37 +250,46 @@ class AcousticModelTrainingMixin(
             return self.subset
         return self.worker.num_utterances
 
-    @property
-    def workflow(self):
-        with self.session() as session:
-            wf = (
-                session.query(CorpusWorkflow)
-                .filter(CorpusWorkflow.name == self.identifier)
-                .first()
-            )
-        return wf
-
     def initialize_training(self) -> None:
         """Initialize training"""
         begin = time.time()
-        logger.info(f"Initializing training for {self.identifier}...")
+        dirty_path = os.path.join(self.working_directory, "dirty")
+        done_path = os.path.join(self.working_directory, "done")
+        self.log_info(f"Initializing training for {self.identifier}...")
         if self.subset and self.subset >= self.worker.num_utterances:
-            logger.warning(
+            self.log_warning(
                 "Subset specified is larger than the dataset, "
                 "using full corpus for this training block."
             )
             self.subset = 0
             self.worker.current_subset = 0
-        os.makedirs(self.working_log_directory, exist_ok=True)
-        self._trainer_initialization()
+        try:
+            self._trainer_initialization()
+        except Exception as e:
+            with mfa_open(dirty_path, "w"):
+                pass
+            if isinstance(e, KaldiProcessingError):
+
+                logger = logging.getLogger(self.identifier)
+                log_kaldi_errors(e.error_logs, logger)
+                e.update_log_file(logger)
+            raise
         self.iteration = 1
         self.worker.current_trainer = self
         self.compute_calculated_properties()
         self.current_gaussians = self.initial_gaussians
-        logger.info("Initialization complete!")
-        logger.debug(
-            f"Initialization for {self.identifier} took {time.time() - begin:.3f} seconds"
-        )
+        if self.initialized:
+            self.log_info(
+                f"{self.identifier} training already initialized, skipping initialization."
+            )
+            if os.path.exists(done_path):
+                self.training_complete = True
+            return
+        if os.path.exists(dirty_path):  # if there was an error, let's redo from scratch
+            shutil.rmtree(self.working_directory)
+        os.makedirs(self.working_log_directory, exist_ok=True)
+        self.log_info("Initialization complete!")
+        self.log_debug(f"Initialization for {self.identifier} took {time.time() - begin} seconds")
 
     @abstractmethod
     def _trainer_initialization(self) -> None:
@@ -262,40 +307,40 @@ class AcousticModelTrainingMixin(
         }
 
     @property
-    def working_directory(self) -> Path:
+    def working_directory(self) -> str:
         """Training directory"""
-        return self.worker.output_directory.joinpath(self.identifier)
+        return os.path.join(self.worker.output_directory, self.identifier)
 
     @property
-    def working_log_directory(self) -> Path:
+    def working_log_directory(self) -> str:
         """Training log directory"""
-        return self.working_directory.joinpath("log")
+        return os.path.join(self.working_directory, "log")
 
     @property
-    def model_path(self) -> Path:
+    def model_path(self) -> str:
         """Current acoustic model path"""
-        if self.workflow.done:
+        if self.training_complete:
             return self.next_model_path
-        return self.working_directory.joinpath(f"{self.iteration}.mdl")
+        return os.path.join(self.working_directory, f"{self.iteration}.mdl")
 
     @property
-    def alignment_model_path(self) -> Path:
+    def alignment_model_path(self) -> str:
         """Alignment model path"""
         return self.model_path
 
     @property
-    def next_model_path(self) -> Path:
+    def next_model_path(self) -> str:
         """Next iteration's acoustic model path"""
-        if self.workflow.done:
-            return self.working_directory.joinpath("final.mdl")
-        return self.working_directory.joinpath(f"{self.iteration + 1}.mdl")
+        if self.training_complete:
+            return os.path.join(self.working_directory, "final.mdl")
+        return os.path.join(self.working_directory, f"{self.iteration + 1}.mdl")
 
     @property
-    def next_occs_path(self) -> Path:
+    def next_occs_path(self) -> str:
         """Next iteration's occs file path"""
-        if self.workflow.done:
-            return self.working_directory.joinpath("final.occs")
-        return self.working_directory.joinpath(f"{self.iteration + 1}.occs")
+        if self.training_complete:
+            return os.path.join(self.working_directory, "final.occs")
+        return os.path.join(self.working_directory, f"{self.iteration + 1}.occs")
 
     @abstractmethod
     def compute_calculated_properties(self) -> None:
@@ -325,10 +370,12 @@ class AcousticModelTrainingMixin(
         :kaldi_steps:`train_deltas`
             Reference Kaldi script
         """
-        logger.info("Accumulating statistics...")
+        self.log_info("Accumulating statistics...")
         arguments = self.acc_stats_arguments()
-        with tqdm(total=self.num_current_utterances, disable=GLOBAL_CONFIG.quiet) as pbar:
-            if GLOBAL_CONFIG.use_mp:
+        with tqdm.tqdm(
+            total=self.num_current_utterances, disable=getattr(self, "quiet", False)
+        ) as pbar:
+            if self.use_mp:
                 error_dict = {}
                 return_queue = mp.Queue()
                 stopped = Stopped()
@@ -366,7 +413,7 @@ class AcousticModelTrainingMixin(
                     for num_utterances, errors in function.run():
                         pbar.update(num_utterances + errors)
 
-        log_path = self.working_log_directory.joinpath(f"update.{self.iteration}.log")
+        log_path = os.path.join(self.working_log_directory, f"update.{self.iteration}.log")
         with mfa_open(log_path, "w") as log_file:
             acc_files = []
             for a in arguments:
@@ -427,9 +474,9 @@ class AcousticModelTrainingMixin(
             log_like = avg_like_sum / avg_like_frames
             if average_logdet_frames:
                 log_like += average_logdet_sum / average_logdet_frames
-            logger.debug(f"Likelihood for iteration {self.iteration}: {log_like}")
+            self.log_debug(f"Likelihood for iteration {self.iteration}: {log_like}")
 
-        if not GLOBAL_CONFIG.debug:
+        if not self.debug:
             for f in acc_files:
                 os.remove(f)
 
@@ -437,22 +484,22 @@ class AcousticModelTrainingMixin(
         """Run alignment for a training iteration"""
         begin = time.time()
         self.align_utterances(training=True)
-        logger.debug(
+        self.log_debug(
             f"Generating alignments for iteration {self.iteration} took {time.time()-begin} seconds"
         )
-        logger.debug(f"Analyzing information for alignment in iteration {self.iteration}...")
+        self.log_debug(f"Analyzing information for alignment in iteration {self.iteration}...")
         begin = time.time()
         self.compile_information()
-        logger.debug(
+        self.log_debug(
             f"Analyzing iteration {self.iteration} alignments took {time.time()-begin} seconds"
         )
 
     @property
     def initialized(self) -> bool:
         return (
-            os.path.exists(self.working_directory.joinpath("1.mdl"))
-            or os.path.exists(self.working_directory.joinpath("final.mdl"))
-            or os.path.exists(self.working_directory.joinpath("done"))
+            os.path.exists(os.path.join(self.working_directory, "1.mdl"))
+            or os.path.exists(os.path.join(self.working_directory, "final.mdl"))
+            or os.path.exists(os.path.join(self.working_directory, "done"))
         )
 
     def train_iteration(self) -> None:
@@ -480,37 +527,39 @@ class AcousticModelTrainingMixin(
         :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
             If there were any errors in running Kaldi binaries
         """
+        done_path = os.path.join(self.working_directory, "done")
+        dirty_path = os.path.join(self.working_directory, "dirty")
         os.makedirs(self.working_log_directory, exist_ok=True)
-        wf = self.worker.current_workflow
-        if wf.done:
-            return
         try:
             self.initialize_training()
-
+            if self.training_complete:
+                return
             begin = time.time()
             for iteration in range(1, self.num_iterations + 1):
-                logger.info(f"{self.identifier} - Iteration {iteration} of {self.num_iterations}")
+                self.log_info(
+                    f"{self.identifier} - Iteration {iteration} of {self.num_iterations}"
+                )
                 self.iteration = iteration
                 self.train_iteration()
             self.finalize_training()
         except Exception as e:
-            if not isinstance(e, KeyboardInterrupt):
-                with self.session() as session:
-                    session.query(CorpusWorkflow).filter(CorpusWorkflow.id == wf.id).update(
-                        {"dirty": True}
-                    )
-                    session.commit()
-                if isinstance(e, KaldiProcessingError):
-                    log_kaldi_errors(e.error_logs)
-                    e.update_log_file()
+            with mfa_open(dirty_path, "w"):
+                pass
+            if isinstance(e, KaldiProcessingError):
+
+                logger = logging.getLogger(self.identifier)
+                log_kaldi_errors(e.error_logs, logger)
+                e.update_log_file(logger)
             raise
-        logger.info("Training complete!")
-        logger.debug(f"Training took {time.time() - begin:.3f} seconds")
+        with mfa_open(done_path, "w"):
+            pass
+        self.log_info("Training complete!")
+        self.log_debug(f"Training took {time.time() - begin} seconds")
 
     @property
-    def exported_model_path(self) -> Path:
+    def exported_model_path(self) -> str:
         """Model path to export to once training is complete"""
-        return self.working_log_directory.joinpath("acoustic_model.zip")
+        return os.path.join(self.working_log_directory, "acoustic_model.zip")
 
     def finalize_training(self) -> None:
         """
@@ -519,40 +568,37 @@ class AcousticModelTrainingMixin(
 
         """
         os.rename(
-            self.working_directory.joinpath(f"{self.num_iterations+1}.mdl"),
-            self.working_directory.joinpath("final.mdl"),
+            os.path.join(self.working_directory, f"{self.num_iterations+1}.mdl"),
+            os.path.join(self.working_directory, "final.mdl"),
         )
-        final_occs_path = self.working_directory.joinpath("final.occs")
+        final_occs_path = os.path.join(self.working_directory, "final.occs")
         if not os.path.exists(final_occs_path):
             os.rename(
-                self.working_directory.joinpath(f"{self.num_iterations+1}.occs"),
+                os.path.join(self.working_directory, f"{self.num_iterations+1}.occs"),
                 final_occs_path,
             )
-        ali_model_path = self.working_directory.joinpath(f"{self.num_iterations+1}.alimdl")
+        ali_model_path = os.path.join(self.working_directory, f"{self.num_iterations+1}.alimdl")
         if os.path.exists(ali_model_path):
             os.rename(
                 ali_model_path,
-                self.working_directory.joinpath("final.alimdl"),
+                os.path.join(self.working_directory, "final.alimdl"),
             )
         self.export_model(self.exported_model_path)
-        if not GLOBAL_CONFIG.debug:
+        if not self.debug:
             for i in range(1, self.num_iterations + 1):
-                model_path = self.working_directory.joinpath(f"{i}.mdl")
+                model_path = os.path.join(self.working_directory, f"{i}.mdl")
                 try:
                     os.remove(model_path)
                 except FileNotFoundError:
                     pass
                 try:
-                    os.remove(self.working_directory.joinpath(f"{i}.occs"))
+                    os.remove(os.path.join(self.working_directory, f"{i}.occs"))
                 except FileNotFoundError:
                     pass
             for file in os.listdir(self.working_directory):
                 if any(file.startswith(x) for x in ["fsts.", "trans.", "ali."]):
-                    os.remove(self.working_directory.joinpath(file))
-        wf = self.worker.current_workflow
-        with self.session() as session:
-            session.query(CorpusWorkflow).filter(CorpusWorkflow.id == wf.id).update({"done": True})
-            session.commit()
+                    os.remove(os.path.join(self.working_directory, file))
+        self.training_complete = True
         self.worker.current_trainer = None
 
     @property
@@ -569,10 +615,6 @@ class AcousticModelTrainingMixin(
     def phone_type(self) -> str:
         """Phone type, not implemented for BaseTrainer"""
         raise NotImplementedError
-
-    @property
-    def use_g2p(self):
-        return self.worker.use_g2p
 
     @property
     def meta(self) -> MetaDict:
@@ -594,7 +636,6 @@ class AcousticModelTrainingMixin(
             utterance_count, duration, average_log_likelihood = summary.first()
         data = {
             "phones": sorted(self._generate_non_positional_list(self.non_silence_phones)),
-            "phone_groups": self.worker.phone_groups,
             "version": get_mfa_version(),
             "architecture": self.architecture,
             "train_date": str(datetime.now()),
@@ -613,8 +654,8 @@ class AcousticModelTrainingMixin(
                 "oov_word": self.worker.oov_word,
                 "bracketed_word": self.worker.bracketed_word,
                 "laughter_word": self.worker.laughter_word,
-                "clitic_marker": self.worker.clitic_marker,
                 "position_dependent_phones": self.worker.position_dependent_phones,
+                "clitic_marker": self.worker.clitic_marker,
             },
             "features": self.feature_options,
             "oov_phone": self.worker.oov_phone,
@@ -627,7 +668,7 @@ class AcousticModelTrainingMixin(
         }
         return data
 
-    def export_model(self, output_model_path: Path) -> None:
+    def export_model(self, output_model_path: str) -> None:
         """
         Export an acoustic model to the specified path
 
@@ -636,11 +677,9 @@ class AcousticModelTrainingMixin(
         output_model_path : str
             Path to save acoustic model
         """
-        directory = output_model_path.parent
-
-        acoustic_model = AcousticModel.empty(
-            output_model_path.stem, root_directory=self.working_log_directory
-        )
+        directory, filename = os.path.split(output_model_path)
+        basename, _ = os.path.splitext(filename)
+        acoustic_model = AcousticModel.empty(basename, root_directory=self.working_log_directory)
         acoustic_model.add_meta_file(self)
         acoustic_model.add_model(self.working_directory)
         acoustic_model.add_pronunciation_models(

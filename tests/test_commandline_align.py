@@ -1,73 +1,77 @@
 import os
 
-import click.testing
-import pytest
 from praatio import textgrid as tgio
 
-from montreal_forced_aligner.command_line.mfa import mfa_cli
+from montreal_forced_aligner.alignment.pretrained import PretrainedAligner
+from montreal_forced_aligner.command_line.align import run_align_corpus
+from montreal_forced_aligner.command_line.mfa import parser
 
 
-@pytest.mark.timeout(200)
-def test_align_no_speaker_adaptation(
-    basic_corpus_dir, generated_dir, english_dictionary, temp_dir, english_acoustic_model, db_setup
+def assert_export_exist(old_directory, new_directory):
+    for root, dirs, files in os.walk(old_directory):
+        new_root = root.replace(old_directory, new_directory)
+        for d in dirs:
+            assert os.path.exists(os.path.join(new_root, d))
+        for f in files:
+            if not f.endswith(".wav"):
+                continue
+            new_f = f.replace(".wav", ".TextGrid")
+            assert os.path.exists(os.path.join(new_root, new_f))
+
+
+def test_align_arguments(
+    basic_corpus_dir,
+    generated_dir,
+    english_dictionary,
+    temp_dir,
+    english_acoustic_model,
 ):
-    output_directory = generated_dir.joinpath("basic_output")
+
     command = [
         "align",
         basic_corpus_dir,
         english_dictionary,
         "english_us_arpa",
-        output_directory,
+        os.path.join(generated_dir, "basic_output"),
+        "-t",
+        temp_dir,
         "-q",
         "--clean",
         "--debug",
-        "--verbose",
-        "--no_uses_speaker_adaptation",
-        "-p",
-        "test",
+        "--uses_speaker_adaptation",
+        "False",
     ]
-    command = [str(x) for x in command]
-    click.testing.CliRunner().invoke(mfa_cli, command, catch_exceptions=False)
-    assert os.path.exists(output_directory)
+    args, unknown_args = parser.parse_known_args(command)
+    params = PretrainedAligner.parse_parameters(args=args, unknown_args=unknown_args)
+    assert not params["uses_speaker_adaptation"]
 
 
-@pytest.mark.timeout(200)
-def test_align_single_speaker(
+# @pytest.mark.skip(reason='Optimization')
+def test_align_basic(
     basic_corpus_dir,
     generated_dir,
     english_dictionary,
     temp_dir,
     basic_align_config_path,
     english_acoustic_model,
-    db_setup,
 ):
-    output_directory = generated_dir.joinpath("basic_align_output")
+    output_directory = os.path.join(generated_dir, "basic_align_output")
     command = [
         "align",
         basic_corpus_dir,
         english_dictionary,
         english_acoustic_model,
         output_directory,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "--single_speaker",
-        "--no_use_mp",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     assert os.path.exists(output_directory)
 
@@ -84,7 +88,6 @@ def test_align_single_speaker(
         assert os.path.exists(path)
 
 
-@pytest.mark.timeout(200)
 def test_align_duplicated(
     duplicated_name_corpus_dir,
     generated_dir,
@@ -92,33 +95,24 @@ def test_align_duplicated(
     temp_dir,
     basic_align_config_path,
     english_acoustic_model,
-    db_setup,
 ):
-    output_directory = generated_dir.joinpath("duplicated_align_output")
+    output_directory = os.path.join(generated_dir, "duplicated_align_output")
     command = [
         "align",
         duplicated_name_corpus_dir,
         english_dictionary,
         english_acoustic_model,
         output_directory,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
-        "--no_debug",
-        "-p",
-        "test",
+        "--debug",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     assert os.path.exists(output_directory)
 
@@ -132,7 +126,6 @@ def test_align_duplicated(
         assert os.path.exists(path)
 
 
-@pytest.mark.timeout(200)
 def test_align_multilingual(
     multilingual_ipa_corpus_dir,
     english_uk_mfa_dictionary,
@@ -140,7 +133,6 @@ def test_align_multilingual(
     temp_dir,
     basic_align_config_path,
     english_mfa_acoustic_model,
-    db_setup,
 ):
 
     command = [
@@ -148,7 +140,9 @@ def test_align_multilingual(
         multilingual_ipa_corpus_dir,
         english_uk_mfa_dictionary,
         english_mfa_acoustic_model,
-        generated_dir.joinpath("multilingual"),
+        os.path.join(generated_dir, "multilingual"),
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
@@ -156,22 +150,11 @@ def test_align_multilingual(
         "--debug",
         "--output_format",
         "short_textgrid",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
 
-@pytest.mark.timeout(200)
 def test_align_multilingual_speaker_dict(
     multilingual_ipa_corpus_dir,
     mfa_speaker_dict_path,
@@ -179,7 +162,6 @@ def test_align_multilingual_speaker_dict(
     temp_dir,
     basic_align_config_path,
     english_mfa_acoustic_model,
-    db_setup,
 ):
 
     command = [
@@ -187,7 +169,9 @@ def test_align_multilingual_speaker_dict(
         multilingual_ipa_corpus_dir,
         mfa_speaker_dict_path,
         english_mfa_acoustic_model,
-        generated_dir.joinpath("multilingual_speaker_dict"),
+        os.path.join(generated_dir, "multilingual_speaker_dict"),
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
@@ -195,22 +179,11 @@ def test_align_multilingual_speaker_dict(
         "--debug",
         "--output_format",
         "json",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
 
-@pytest.mark.timeout(200)
 def test_align_multilingual_tg_speaker_dict(
     multilingual_ipa_tg_corpus_dir,
     mfa_speaker_dict_path,
@@ -218,7 +191,6 @@ def test_align_multilingual_tg_speaker_dict(
     temp_dir,
     basic_align_config_path,
     english_mfa_acoustic_model,
-    db_setup,
 ):
 
     command = [
@@ -226,29 +198,20 @@ def test_align_multilingual_tg_speaker_dict(
         multilingual_ipa_tg_corpus_dir,
         mfa_speaker_dict_path,
         english_mfa_acoustic_model,
-        generated_dir.joinpath("multilingual_speaker_dict_tg"),
+        os.path.join(generated_dir, "multilingual_speaker_dict_tg"),
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
         "--include_original_text",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
 
-@pytest.mark.timeout(200)
 def test_align_evaluation(
     basic_corpus_dir,
     english_us_mfa_dictionary,
@@ -258,7 +221,6 @@ def test_align_evaluation(
     english_mfa_acoustic_model,
     basic_reference_dir,
     eval_mapping_path,
-    db_setup,
 ):
 
     command = [
@@ -266,35 +228,23 @@ def test_align_evaluation(
         basic_corpus_dir,
         english_us_mfa_dictionary,
         english_mfa_acoustic_model,
-        generated_dir.joinpath("align_eval_output"),
+        os.path.join(generated_dir, "align_eval_output"),
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "--no_use_mp",
-        "--fine_tune",
-        "--phone_confidence",
         "--reference_directory",
         basic_reference_dir,
         "--custom_mapping_path",
         eval_mapping_path,
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
 
-@pytest.mark.timeout(200)
 def test_align_split(
     basic_split_dir,
     english_us_mfa_dictionary,
@@ -303,7 +253,6 @@ def test_align_split(
     basic_align_config_path,
     english_acoustic_model,
     english_mfa_acoustic_model,
-    db_setup,
 ):
     audio_dir, text_dir = basic_split_dir
     command = [
@@ -311,32 +260,21 @@ def test_align_split(
         text_dir,
         english_us_mfa_dictionary,
         english_mfa_acoustic_model,
-        generated_dir.joinpath("multilingual"),
+        os.path.join(generated_dir, "multilingual"),
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "--output_format",
-        "json",
         "--audio_directory",
         audio_dir,
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
 
-@pytest.mark.timeout(200)
 def test_align_stereo(
     stereo_corpus_dir,
     generated_dir,
@@ -344,41 +282,31 @@ def test_align_stereo(
     temp_dir,
     basic_align_config_path,
     english_acoustic_model,
-    db_setup,
 ):
-    output_dir = generated_dir.joinpath("stereo_output")
+    output_dir = os.path.join(generated_dir, "stereo_output")
     command = [
         "align",
         stereo_corpus_dir,
         english_dictionary,
         english_acoustic_model,
         output_dir,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     tg = tgio.openTextgrid(
         os.path.join(output_dir, "michaelandsickmichael.TextGrid"), includeEmptyIntervals=False
     )
-    assert len(tg.tierNames) == 4
+    assert len(tg.tierNameList) == 4
 
 
-@pytest.mark.timeout(200)
 def test_align_mp3s(
     mp3_corpus_dir,
     generated_dir,
@@ -386,41 +314,31 @@ def test_align_mp3s(
     temp_dir,
     basic_align_config_path,
     english_acoustic_model,
-    db_setup,
 ):
-    output_dir = generated_dir.joinpath("mp3_output")
+    output_dir = os.path.join(generated_dir, "mp3_output")
     command = [
         "align",
         mp3_corpus_dir,
         english_dictionary,
         english_acoustic_model,
         output_dir,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     tg = tgio.openTextgrid(
         os.path.join(output_dir, "common_voice_en_22058267.TextGrid"), includeEmptyIntervals=False
     )
-    assert len(tg.tierNames) == 2
+    assert len(tg.tierNameList) == 2
 
 
-@pytest.mark.timeout(200)
 def test_align_opus(
     opus_corpus_dir,
     generated_dir,
@@ -428,41 +346,31 @@ def test_align_opus(
     temp_dir,
     basic_align_config_path,
     english_acoustic_model,
-    db_setup,
 ):
-    output_dir = generated_dir.joinpath("opus_output")
+    output_dir = os.path.join(generated_dir, "opus_output")
     command = [
         "align",
         opus_corpus_dir,
         english_dictionary,
         english_acoustic_model,
         output_dir,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     tg = tgio.openTextgrid(
         os.path.join(output_dir, "13697_11991_000000.TextGrid"), includeEmptyIntervals=False
     )
-    assert len(tg.tierNames) == 2
+    assert len(tg.tierNameList) == 2
 
 
-@pytest.mark.timeout(200)
 def test_swedish_cv(
     swedish_dir,
     generated_dir,
@@ -470,33 +378,24 @@ def test_swedish_cv(
     temp_dir,
     basic_align_config_path,
     swedish_cv_acoustic_model,
-    db_setup,
 ):
-    output_dir = generated_dir.joinpath("swedish_cv_output")
+    output_dir = os.path.join(generated_dir, "swedish_cv_output")
     command = [
         "align",
         swedish_dir,
         swedish_cv_dictionary,
         swedish_cv_acoustic_model,
         output_dir,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     output_speaker_dir = os.path.join(output_dir, "se10x016")
     assert os.path.exists(output_speaker_dir)
@@ -509,10 +408,9 @@ def test_swedish_cv(
         tg_path = os.path.join(output_speaker_dir, file + ".TextGrid")
         assert os.path.exists(tg_path)
         tg = tgio.openTextgrid(tg_path, includeEmptyIntervals=False)
-        assert len(tg.tierNames) == 2
+        assert len(tg.tierNameList) == 2
 
 
-@pytest.mark.timeout(200)
 def test_swedish_mfa(
     swedish_dir,
     generated_dir,
@@ -520,33 +418,24 @@ def test_swedish_mfa(
     temp_dir,
     basic_align_config_path,
     swedish_cv_acoustic_model,
-    db_setup,
 ):
-    output_dir = generated_dir.joinpath("swedish_mfa_output")
+    output_dir = os.path.join(generated_dir, "swedish_mfa_output")
     command = [
         "align",
         swedish_dir,
         swedish_cv_dictionary,
         swedish_cv_acoustic_model,
         output_dir,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "-q",
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     output_speaker_dir = os.path.join(output_dir, "se10x016")
     assert os.path.exists(output_speaker_dir)
@@ -559,10 +448,9 @@ def test_swedish_mfa(
         tg_path = os.path.join(output_speaker_dir, file + ".TextGrid")
         assert os.path.exists(tg_path)
         tg = tgio.openTextgrid(tg_path, includeEmptyIntervals=False)
-        assert len(tg.tierNames) == 2
+        assert len(tg.tierNameList) == 2
 
 
-@pytest.mark.timeout(200)
 def test_acoustic_g2p_model(
     basic_corpus_dir,
     acoustic_model_dir,
@@ -570,34 +458,25 @@ def test_acoustic_g2p_model(
     generated_dir,
     temp_dir,
     basic_align_config_path,
-    db_setup,
 ):
     model_path = os.path.join(acoustic_model_dir, "acoustic_g2p_output_model.zip")
     dict_path = os.path.join(dict_dir, "acoustic_g2p_dictionary.yaml")
-    output_directory = generated_dir.joinpath("acoustic_g2p_output")
+    output_directory = os.path.join(generated_dir, "acoustic_g2p_output")
     command = [
         "align",
         basic_corpus_dir,
         dict_path,
         model_path,
         output_directory,
+        "-t",
+        temp_dir,
         "--config_path",
         basic_align_config_path,
         "--clean",
         "--debug",
-        "-p",
-        "test",
     ]
-    command = [str(x) for x in command]
-    result = click.testing.CliRunner(mix_stderr=False, echo_stdin=True).invoke(
-        mfa_cli, command, catch_exceptions=True
-    )
-    print(result.stdout)
-    print(result.stderr)
-    if result.exception:
-        print(result.exc_info)
-        raise result.exception
-    assert not result.return_value
+    args, unknown = parser.parse_known_args(command)
+    run_align_corpus(args, unknown)
 
     assert os.path.exists(output_directory)
 

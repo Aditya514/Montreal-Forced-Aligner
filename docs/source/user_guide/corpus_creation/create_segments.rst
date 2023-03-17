@@ -1,23 +1,24 @@
-
 .. _create_segments:
 
 Create segments ``(mfa create_segments)``
 =========================================
 
-The Montreal Forced Aligner can use Voice Activity Detection (VAD) capabilities from :xref:`speechbrain` to generate segments from
+The Montreal Forced Aligner can use Voice Activity Detection (VAD) capabilities from Kaldi to generate segments from
 a longer sound file.
 
 .. note::
 
-   On Windows, if you get an ``OSError/WinError 1314`` during the run, follow `these instructions <https://www.scivision.dev/windows-symbolic-link-permission-enable/>`_ to enable symbolic link creation permissions.
+   The default configuration for VAD uses configuration values based on quiet speech. The algorithm is based on energy,
+   so if your recordings are more noisy, you may need to adjust the configuration.  See :ref:`configuration_segmentation`
+   for more information on changing these parameters.
+
 
 Command reference
 -----------------
 
-.. click:: montreal_forced_aligner.command_line.create_segments:create_segments_cli
-   :prog: mfa create_segments
-   :nested: full
-
+.. autoprogram:: montreal_forced_aligner.command_line.mfa:create_parser()
+   :prog: mfa
+   :start_command: create_segments
 
 Configuration reference
 -----------------------

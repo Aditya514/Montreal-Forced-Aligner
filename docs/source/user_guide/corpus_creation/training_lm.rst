@@ -13,9 +13,9 @@ MFA has a utility function for training ARPA-format ngram :term:`language models
 Command reference
 -----------------
 
-.. click:: montreal_forced_aligner.command_line.train_lm:train_lm_cli
-   :prog: mfa train_lm
-   :nested: full
+.. autoprogram:: montreal_forced_aligner.command_line.mfa:create_parser()
+   :prog: mfa
+   :start_command: train_lm
 
 Configuration reference
 -----------------------

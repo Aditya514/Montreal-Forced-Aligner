@@ -1,7 +1,5 @@
 """Mixin module for G2P functionality"""
-import typing
-from abc import ABCMeta
-from pathlib import Path
+from abc import ABCMeta, abstractmethod
 from typing import Dict, List
 
 from montreal_forced_aligner.abc import MfaWorker
@@ -36,6 +34,7 @@ class G2PMixin(metaclass=ABCMeta):
         self.g2p_threshold = g2p_threshold
         self.include_bracketed = include_bracketed
 
+    @abstractmethod
     def generate_pronunciations(self) -> Dict[str, List[str]]:
         """
         Generate pronunciations
@@ -45,12 +44,13 @@ class G2PMixin(metaclass=ABCMeta):
         dict[str, list[str]]
             Mappings of keys to their generated pronunciations
         """
-        raise NotImplementedError
+        ...
 
     @property
+    @abstractmethod
     def words_to_g2p(self) -> List[str]:
         """Words to produce pronunciations"""
-        raise NotImplementedError
+        ...
 
 
 class G2PTopLevelMixin(MfaWorker, DictionaryMixin, G2PMixin):
@@ -70,6 +70,11 @@ class G2PTopLevelMixin(MfaWorker, DictionaryMixin, G2PMixin):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+    @property
+    def workflow_identifier(self) -> str:
+        """G2P workflow identifier"""
+        return "g2p"
+
     def generate_pronunciations(self) -> Dict[str, List[str]]:
         """
         Generate pronunciations
@@ -81,18 +86,15 @@ class G2PTopLevelMixin(MfaWorker, DictionaryMixin, G2PMixin):
         """
         raise NotImplementedError
 
-    def export_pronunciations(self, output_file_path: typing.Union[str, Path]) -> None:
+    def export_pronunciations(self, output_file_path: str) -> None:
         """
         Output pronunciations to text file
 
         Parameters
         ----------
-        output_file_path: :class:`~pathlib.Path`
+        output_file_path: str
             Path to save
         """
-        if isinstance(output_file_path, str):
-            output_file_path = Path(output_file_path)
-        output_file_path.parent.mkdir(parents=True, exist_ok=True)
         results = self.generate_pronunciations()
         with mfa_open(output_file_path, "w") as f:
             for (orthography, pronunciations) in results.items():

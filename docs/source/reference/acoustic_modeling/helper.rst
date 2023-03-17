@@ -49,13 +49,6 @@ Multiprocessing workers and functions
 
    AccStatsTwoFeatsFunction
 
-.. currentmodule:: montreal_forced_aligner.acoustic_modeling.trainer
-
-.. autosummary::
-   :toctree: generated/
-
-   TransitionAccFunction
-
 Multiprocessing argument classes
 --------------------------------
 
@@ -90,10 +83,3 @@ Multiprocessing argument classes
    :toctree: generated/
 
    AccStatsTwoFeatsArguments
-
-.. currentmodule:: montreal_forced_aligner.acoustic_modeling.trainer
-
-.. autosummary::
-   :toctree: generated/
-
-   TransitionAccArguments

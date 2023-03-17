@@ -5,20 +5,18 @@ MFA configuration
 """
 from __future__ import annotations
 
-import os
-import pathlib
 import re
-import typing
-from typing import Any, Dict, List, Union
-
-import dataclassy
-import joblib
-import rich_click as click
-import yaml
-from dataclassy import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from montreal_forced_aligner.exceptions import RootDirectoryError
 from montreal_forced_aligner.helper import mfa_open
+
+if TYPE_CHECKING:
+    from argparse import Namespace
+
+import os
+
+import yaml
 
 __all__ = [
     "generate_config_path",
@@ -26,69 +24,58 @@ __all__ = [
     "load_command_history",
     "get_temporary_directory",
     "update_command_history",
-    "MfaConfiguration",
-    "GLOBAL_CONFIG",
-    "MFA_ROOT_ENVIRONMENT_VARIABLE",
-    "MFA_PROFILE_VARIABLE",
-    "IVECTOR_DIMENSION",
-    "XVECTOR_DIMENSION",
-    "PLDA_DIMENSION",
-    "MEMORY",
+    "update_global_config",
+    "load_global_config",
+    "USE_COLORS",
+    "BLAS_THREADS",
 ]
 
 MFA_ROOT_ENVIRONMENT_VARIABLE = "MFA_ROOT_DIR"
-MFA_PROFILE_VARIABLE = "MFA_PROFILE"
-
-IVECTOR_DIMENSION = 192
-XVECTOR_DIMENSION = 192
-PLDA_DIMENSION = 192
 
 
-def get_temporary_directory() -> pathlib.Path:
+def get_temporary_directory():
     """
     Get the root temporary directory for MFA
 
     Returns
     -------
-    Path
+    str
         Root temporary directory
 
     Raises
     ------
-        :class:`~montreal_forced_aligner.exceptions.RootDirectoryError`
+    :class:`~montreal_forced_aligner.exceptions.RootDirectoryError`
     """
-    TEMP_DIR = pathlib.Path(
-        os.environ.get(MFA_ROOT_ENVIRONMENT_VARIABLE, "~/Documents/MFA")
-    ).expanduser()
+    TEMP_DIR = os.environ.get(MFA_ROOT_ENVIRONMENT_VARIABLE, os.path.expanduser("~/Documents/MFA"))
     try:
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        os.makedirs(TEMP_DIR, exist_ok=True)
     except OSError:
         raise RootDirectoryError(TEMP_DIR, MFA_ROOT_ENVIRONMENT_VARIABLE)
     return TEMP_DIR
 
 
-def generate_config_path() -> pathlib.Path:
+def generate_config_path() -> str:
     """
     Generate the global configuration path for MFA
 
     Returns
     -------
-    Path
+    str
         Full path to configuration yaml
     """
-    return get_temporary_directory().joinpath("global_config.yaml")
+    return os.path.join(get_temporary_directory(), "global_config.yaml")
 
 
-def generate_command_history_path() -> pathlib.Path:
+def generate_command_history_path() -> str:
     """
     Generate the path to the command history file
 
     Returns
     -------
-    Path
+    str
         Full path to history file
     """
-    return get_temporary_directory().joinpath("command_history.yaml")
+    return os.path.join(get_temporary_directory(), "command_history.yaml")
 
 
 def load_command_history() -> List[Dict[str, Any]]:
@@ -102,11 +89,9 @@ def load_command_history() -> List[Dict[str, Any]]:
     """
     path = generate_command_history_path()
     history = []
-    if path.exists():
+    if os.path.exists(path):
         with mfa_open(path, "r") as f:
-            history = yaml.load(f, Loader=yaml.Loader)
-            if not history:
-                history = []
+            history = yaml.safe_load(f)
     for h in history:
         h["command"] = re.sub(r"^\S+.py ", "mfa ", h["command"])
     return history
@@ -131,127 +116,114 @@ def update_command_history(command_data: Dict[str, Any]) -> None:
     history.append(command_data)
     history = history[-50:]
     with mfa_open(path, "w") as f:
-        yaml.dump(history, f, Dumper=yaml.Dumper, allow_unicode=True)
+        yaml.safe_dump(history, f)
 
 
-@dataclass(slots=True)
-class MfaProfile:
+def update_global_config(args: Namespace) -> None:
     """
-    Configuration class for a profile used from the command line
+    Update global configuration of MFA
+
+    Parameters
+    ----------
+    args: :class:`~argparse.Namespace`
+        Arguments to set
     """
+    global_configuration_file = generate_config_path()
+    default_config = {
+        "clean": False,
+        "verbose": False,
+        "debug": False,
+        "overwrite": False,
+        "terminal_colors": True,
+        "terminal_width": 120,
+        "cleanup_textgrids": True,
+        "detect_phone_set": False,
+        "num_jobs": 3,
+        "blas_num_threads": 1,
+        "use_mp": True,
+        "temporary_directory": get_temporary_directory(),
+    }
+    if os.path.exists(global_configuration_file):
+        with mfa_open(global_configuration_file, "r") as f:
+            data = yaml.safe_load(f)
+            default_config.update(data)
+    if args.always_clean:
+        default_config["clean"] = True
+    if args.never_clean:
+        default_config["clean"] = False
+    if args.always_verbose:
+        default_config["verbose"] = True
+    if args.never_verbose:
+        default_config["verbose"] = False
+    if args.always_debug:
+        default_config["debug"] = True
+    if args.never_debug:
+        default_config["debug"] = False
+    if args.always_overwrite:
+        default_config["overwrite"] = True
+    if args.never_overwrite:
+        default_config["overwrite"] = False
+    if args.disable_mp:
+        default_config["use_mp"] = False
+    if args.enable_mp:
+        default_config["use_mp"] = True
+    if args.disable_textgrid_cleanup:
+        default_config["cleanup_textgrids"] = False
+    if args.enable_textgrid_cleanup:
+        default_config["cleanup_textgrids"] = True
+    if args.disable_detect_phone_set:
+        default_config["detect_phone_set"] = False
+    if args.enable_detect_phone_set:
+        default_config["detect_phone_set"] = True
+    if args.disable_terminal_colors:
+        default_config["terminal_colors"] = False
+    if args.enable_terminal_colors:
+        default_config["terminal_colors"] = True
+    if args.num_jobs and args.num_jobs > 0:
+        default_config["num_jobs"] = args.num_jobs
+    if args.terminal_width and args.terminal_width > 0:
+        default_config["terminal_width"] = args.terminal_width
+    if args.blas_num_threads and args.blas_num_threads > 0:
+        default_config["blas_num_threads"] = args.blas_num_threads
+    if args.temporary_directory:
+        default_config["temporary_directory"] = args.temporary_directory
+    with mfa_open(global_configuration_file, "w") as f:
+        yaml.dump(default_config, f)
 
-    clean: bool = False
-    verbose: bool = False
-    debug: bool = False
-    quiet: bool = False
-    overwrite: bool = False
-    cleanup_textgrids: bool = True
-    database_backend: str = "psycopg2"
-    database_limited_mode: bool = False
-    bytes_limit: int = 100e6
-    seed: int = 0
-    num_jobs: int = 3
-    blas_num_threads: int = 1
-    use_mp: bool = True
-    single_speaker: bool = False
-    auto_server: bool = False
-    temporary_directory: pathlib.Path = get_temporary_directory()
-    github_token: typing.Optional[str] = None
 
-    def __getitem__(self, item):
-        """Get key from profile"""
-        return getattr(self, item)
-
-    def update(self, data: Union[Dict[str, Any], click.Context]) -> None:
-        """
-        Update configuration from new data
-
-        Parameters
-        ----------
-        data: typing.Union[dict[str, typing.Any], :class:`click.Context`]
-            Parameters to update
-        """
-        for k, v in data.items():
-            if k == "temp_directory":
-                k = "temporary_directory"
-            if v is None:
-                continue
-            if k == "temporary_directory":
-                v = pathlib.Path(v)
-            if hasattr(self, k):
-                setattr(self, k, v)
-
-
-class MfaConfiguration:
+def load_global_config() -> Dict[str, Any]:
     """
-    Global MFA configuration class
+    Load the global MFA configuration
+
+    Returns
+    -------
+    dict[str, Any]
+        Global configuration
     """
-
-    def __init__(self):
-        self.current_profile_name = os.getenv(MFA_PROFILE_VARIABLE, "global")
-        self.config_path = generate_config_path()
-        self.global_profile = MfaProfile()
-        self.profiles: Dict[str, MfaProfile] = {}
-        self.profiles["global"] = self.global_profile
-        if not os.path.exists(self.config_path):
-            self.save()
-        else:
-            self.load()
-
-    def __getattr__(self, item):
-        """Get key from current profile"""
-        if hasattr(self.current_profile, item):
-            return getattr(self.current_profile, item)
-
-    def __getitem__(self, item):
-        """Get key from current profile"""
-        if hasattr(self.current_profile, item):
-            return getattr(self.current_profile, item)
-
-    @property
-    def database_socket(self):
-        p = get_temporary_directory().joinpath(f"pg_mfa_{self.current_profile_name}_socket")
-        p.mkdir(parents=True, exist_ok=True)
-        return p.as_posix()
-
-    @property
-    def current_profile(self) -> MfaProfile:
-        """Name of the current :class:`~montreal_forced_aligner.config.MfaProfile`"""
-        self.current_profile_name = os.getenv(MFA_PROFILE_VARIABLE, "global")
-        if self.current_profile_name not in self.profiles:
-            self.profiles[self.current_profile_name] = MfaProfile()
-            self.profiles[self.current_profile_name].update(dataclassy.asdict(self.global_profile))
-        return self.profiles[self.current_profile_name]
-
-    def save(self) -> None:
-        """Save MFA configuration"""
-        global_configuration_file = generate_config_path()
-        data = dataclassy.asdict(self.global_profile)
-        data["profiles"] = {
-            k: dataclassy.asdict(v) for k, v in self.profiles.items() if k != "global"
-        }
-        with mfa_open(global_configuration_file, "w") as f:
-            yaml.dump(data, f)
-
-    def load(self) -> None:
-        """Load MFA configuration"""
-        with mfa_open(self.config_path, "r") as f:
-            data = yaml.load(f, Loader=yaml.Loader)
-        for name, p in data.pop("profiles", {}).items():
-            self.profiles[name] = MfaProfile()
-            self.profiles[name].update(p)
-        self.global_profile.update(data)
-        if (
-            self.current_profile_name not in self.profiles
-            and self.current_profile_name != "global"
-        ):
-            self.profiles[self.current_profile_name] = MfaProfile()
-            self.profiles[self.current_profile_name].update(data)
+    global_configuration_file = generate_config_path()
+    default_config = {
+        "clean": False,
+        "verbose": False,
+        "quiet": False,
+        "debug": False,
+        "overwrite": False,
+        "terminal_colors": True,
+        "terminal_width": 120,
+        "cleanup_textgrids": True,
+        "detect_phone_set": False,
+        "num_jobs": 3,
+        "blas_num_threads": 1,
+        "use_mp": True,
+        "temporary_directory": get_temporary_directory(),
+    }
+    if os.path.exists(global_configuration_file):
+        with mfa_open(global_configuration_file, "r") as f:
+            data = yaml.safe_load(f)
+            default_config.update(data)
+    if "temp_directory" in default_config:
+        default_config["temporary_directory"] = default_config["temp_directory"]
+    return default_config
 
 
-GLOBAL_CONFIG = MfaConfiguration()
-MEMORY = joblib.Memory(
-    location=os.path.join(get_temporary_directory(), "joblib_cache"),
-    verbose=4 if GLOBAL_CONFIG.current_profile.verbose else 0,
-    bytes_limit=GLOBAL_CONFIG.current_profile.bytes_limit,
-)
+USE_COLORS = load_global_config().get("terminal_colors", True)
+BLAS_THREADS = load_global_config().get("blas_num_threads", 1)

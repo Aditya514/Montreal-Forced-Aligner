@@ -1,5 +1,4 @@
 import os
-import shutil
 
 from montreal_forced_aligner.dictionary import MultispeakerDictionary
 from montreal_forced_aligner.g2p.generator import (
@@ -20,7 +19,7 @@ def test_clean_up_word():
     assert m == {"+"}
 
 
-def test_check_bracketed(basic_dict_path, db_setup):
+def test_check_bracketed(basic_dict_path):
     """Checks if the brackets are removed correctly and handling an empty string works"""
     word_set = ["uh", "(the)", "sick", "<corpus>", "[a]", "{cold}", ""]
     expected_result = ["uh", "sick", ""]
@@ -28,11 +27,10 @@ def test_check_bracketed(basic_dict_path, db_setup):
     assert [x for x in word_set if not dictionary_config.check_bracketed(x)] == expected_result
 
 
-def test_training(basic_dict_path, basic_g2p_model_path, temp_dir, global_config, db_setup):
-    output_directory = os.path.join(temp_dir, "g2p_tests", "train")
-    global_config.temporary_directory = output_directory
+def test_training(basic_dict_path, basic_g2p_model_path, temp_dir):
     trainer = PyniniTrainer(
         dictionary_path=basic_dict_path,
+        temporary_directory=temp_dir,
         random_starts=1,
         num_iterations=5,
         evaluate=True,
@@ -49,21 +47,15 @@ def test_training(basic_dict_path, basic_g2p_model_path, temp_dir, global_config
     trainer.cleanup()
 
 
-def test_generator(
-    basic_g2p_model_path, basic_corpus_dir, g2p_basic_output, temp_dir, global_config, db_setup
-):
-    output_directory = os.path.join(temp_dir, "g2p_tests", "gen")
-    global_config.temporary_directory = output_directory
-    if os.path.exists(output_directory):
-        shutil.rmtree(output_directory, ignore_errors=True)
-    global_config.clean = True
+def test_generator(basic_g2p_model_path, basic_corpus_dir, g2p_basic_output, temp_dir):
+    output_directory = os.path.join(temp_dir, "g2p_tests")
     gen = PyniniCorpusGenerator(
         g2p_model_path=basic_g2p_model_path,
         corpus_directory=basic_corpus_dir,
+        temporary_directory=output_directory,
     )
 
     gen.setup()
-    print(gen.corpus_word_set)
     assert not gen.g2p_model.validate(gen.corpus_word_set)
     assert gen.g2p_model.validate([x for x in gen.corpus_word_set if not gen.check_bracketed(x)])
 
@@ -72,10 +64,9 @@ def test_generator(
     gen.cleanup()
 
 
-def test_generator_pretrained(english_g2p_model, temp_dir, global_config, db_setup):
+def test_generator_pretrained(english_g2p_model, temp_dir):
     words = ["petted", "petted-patted", "pedal"]
     output_directory = os.path.join(temp_dir, "g2p_tests")
-    global_config.temporary_directory = output_directory
     word_list_path = os.path.join(output_directory, "word_list.txt")
     os.makedirs(output_directory, exist_ok=True)
     with mfa_open(word_list_path, "w") as f:
@@ -86,5 +77,6 @@ def test_generator_pretrained(english_g2p_model, temp_dir, global_config, db_set
     )
     gen.setup()
     results = gen.generate_pronunciations()
+    print(results)
     assert len(results["petted"]) == 3
     gen.cleanup()

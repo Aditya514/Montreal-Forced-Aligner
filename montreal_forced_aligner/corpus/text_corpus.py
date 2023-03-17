@@ -1,18 +1,15 @@
 """Class definitions for corpora"""
 from __future__ import annotations
 
-import logging
 import multiprocessing as mp
 import os
 import sys
 import time
-from pathlib import Path
 from queue import Empty
 
-from tqdm.rich import tqdm
+import tqdm
 
 from montreal_forced_aligner.abc import MfaWorker, TemporaryDirectoryMixin
-from montreal_forced_aligner.config import GLOBAL_CONFIG
 from montreal_forced_aligner.corpus.base import CorpusMixin
 from montreal_forced_aligner.corpus.classes import FileData
 from montreal_forced_aligner.corpus.helper import find_exts
@@ -21,8 +18,6 @@ from montreal_forced_aligner.data import DatabaseImportData
 from montreal_forced_aligner.dictionary.multispeaker import MultispeakerDictionaryMixin
 from montreal_forced_aligner.exceptions import TextGridParseError, TextParseError
 from montreal_forced_aligner.utils import Stopped
-
-logger = logging.getLogger("mfa")
 
 
 class TextCorpusMixin(CorpusMixin):
@@ -44,13 +39,14 @@ class TextCorpusMixin(CorpusMixin):
         """
         if self.stopped is None:
             self.stopped = Stopped()
+        sanitize_function = getattr(self, "sanitize_function", None)
         begin_time = time.time()
         job_queue = mp.Queue()
         return_queue = mp.Queue()
         error_dict = {}
         finished_adding = Stopped()
         procs = []
-        for i in range(GLOBAL_CONFIG.num_jobs):
+        for i in range(self.num_jobs):
             p = CorpusProcessWorker(
                 i,
                 job_queue,
@@ -58,6 +54,7 @@ class TextCorpusMixin(CorpusMixin):
                 self.stopped,
                 finished_adding,
                 self.speaker_characters,
+                sanitize_function,
                 sample_rate=0,
             )
             procs.append(p)
@@ -65,11 +62,13 @@ class TextCorpusMixin(CorpusMixin):
         import_data = DatabaseImportData()
         try:
             file_count = 0
-            with tqdm(total=1, disable=GLOBAL_CONFIG.quiet) as pbar, self.session() as session:
+            with tqdm.tqdm(
+                total=1, disable=getattr(self, "quiet", False)
+            ) as pbar, self.session() as session:
                 for root, _, files in os.walk(self.corpus_directory, followlinks=True):
                     exts = find_exts(files)
                     relative_path = (
-                        root.replace(str(self.corpus_directory), "").lstrip("/").lstrip("\\")
+                        root.replace(self.corpus_directory, "").lstrip("/").lstrip("\\")
                     )
 
                     if self.stopped.stop_check():
@@ -118,7 +117,7 @@ class TextCorpusMixin(CorpusMixin):
                     pbar.update(1)
                     import_data.add_objects(self.generate_import_objects(file))
 
-                logger.debug("Waiting for workers to finish...")
+                self.log_debug("Waiting for workers to finish...")
                 for p in procs:
                     p.join()
 
@@ -131,23 +130,24 @@ class TextCorpusMixin(CorpusMixin):
                 for k in ["decode_error_files", "textgrid_read_errors"]:
                     if hasattr(self, k):
                         if k in error_dict:
-                            logger.info(
+                            self.log_info(
                                 "There were some issues with files in the corpus. "
                                 "Please look at the log file or run the validator for more information."
                             )
-                            logger.debug(f"{k} showed {len(error_dict[k])} errors:")
+                            self.log_debug(f"{k} showed {len(error_dict[k])} errors:")
                             if k == "textgrid_read_errors":
-                                getattr(self, k).extend(error_dict[k])
+                                getattr(self, k).update(error_dict[k])
                                 for e in error_dict[k]:
-                                    logger.debug(f"{e.file_name}: {e.error}")
+                                    self.log_debug(f"{e.file_name}: {e.error}")
                             else:
-                                logger.debug(", ".join(error_dict[k]))
+                                self.log_debug(", ".join(error_dict[k]))
                                 setattr(self, k, error_dict[k])
 
         except KeyboardInterrupt:
-            logger.info("Detected ctrl-c, please wait a moment while we clean everything up...")
+            self.log_info("Detected ctrl-c, please wait a moment while we clean everything up...")
             self.stopped.stop()
             finished_adding.stop()
+            job_queue.join()
             self.stopped.set_sigint_source()
             while True:
                 try:
@@ -166,12 +166,12 @@ class TextCorpusMixin(CorpusMixin):
             for p in procs:
                 p.join()
             if self.stopped.stop_check():
-                logger.info(f"Stopped parsing early ({time.time() - begin_time:.3f} seconds)")
+                self.log_info(f"Stopped parsing early ({time.time() - begin_time} seconds)")
                 if self.stopped.source():
                     sys.exit(0)
             else:
-                logger.debug(
-                    f"Parsed corpus directory with {GLOBAL_CONFIG.num_jobs} jobs in {time.time() - begin_time:.3f} seconds"
+                self.log_debug(
+                    f"Parsed corpus directory with {self.num_jobs} jobs in {time.time() - begin_time} seconds"
                 )
 
     def _load_corpus_from_source(self) -> None:
@@ -186,9 +186,7 @@ class TextCorpusMixin(CorpusMixin):
         with self.session() as session:
             for root, _, files in os.walk(self.corpus_directory, followlinks=True):
                 exts = find_exts(files)
-                relative_path = (
-                    root.replace(str(self.corpus_directory), "").lstrip("/").lstrip("\\")
-                )
+                relative_path = root.replace(self.corpus_directory, "").lstrip("/").lstrip("\\")
                 if self.stopped:
                     return
                 for file_name in exts.identifiers:
@@ -218,23 +216,23 @@ class TextCorpusMixin(CorpusMixin):
                         self.textgrid_read_errors.append(e)
             self._finalize_load(session, import_data)
         if self.decode_error_files or self.textgrid_read_errors:
-            logger.info(
+            self.log_info(
                 "There were some issues with files in the corpus. "
                 "Please look at the log file or run the validator for more information."
             )
             if self.decode_error_files:
-                logger.debug(
+                self.log_debug(
                     f"There were {len(self.decode_error_files)} errors decoding text files:"
                 )
-                logger.debug(", ".join(self.decode_error_files))
+                self.log_debug(", ".join(self.decode_error_files))
             if self.textgrid_read_errors:
-                logger.debug(
+                self.log_debug(
                     f"There were {len(self.textgrid_read_errors)} errors decoding reading TextGrid files:"
                 )
                 for e in self.textgrid_read_errors:
-                    logger.debug(f"{e.file_name}: {e.error}")
+                    self.log_debug(f"{e.file_name}: {e.error}")
 
-        logger.debug(f"Parsed corpus directory in {time.time()-begin_time} seconds")
+        self.log_debug(f"Parsed corpus directory in {time.time()-begin_time} seconds")
 
 
 class DictionaryTextCorpusMixin(TextCorpusMixin, MultispeakerDictionaryMixin):
@@ -263,9 +261,8 @@ class DictionaryTextCorpusMixin(TextCorpusMixin, MultispeakerDictionaryMixin):
         self.dictionary_setup()
 
         self._load_corpus()
-        self.initialize_jobs()
-        self.normalize_text()
         self.write_lexicon_information()
+        self.initialize_jobs()
         self.create_corpus_split()
 
 
@@ -274,6 +271,11 @@ class TextCorpus(TextCorpusMixin, MfaWorker, TemporaryDirectoryMixin):
     Standalone class for working with text corpora without a pronunciation dictionary
 
     Most MFA functionality will use the :class:`~montreal_forced_aligner.corpus.text_corpus.TextCorpusMixin` class rather than this class.
+
+    Parameters
+    ----------
+    num_jobs: int
+        Number of jobs to use when loading the corpus
 
     See Also
     --------
@@ -285,8 +287,9 @@ class TextCorpus(TextCorpusMixin, MfaWorker, TemporaryDirectoryMixin):
         For temporary directory parameters
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, num_jobs=3, **kwargs):
         super().__init__(**kwargs)
+        self.num_jobs = num_jobs
 
     def load_corpus(self) -> None:
         """
@@ -304,12 +307,12 @@ class TextCorpus(TextCorpusMixin, MfaWorker, TemporaryDirectoryMixin):
         return self.data_source_identifier
 
     @property
-    def output_directory(self) -> Path:
+    def output_directory(self) -> str:
         """Root temporary directory to store all corpus and dictionary files"""
-        return GLOBAL_CONFIG.current_profile.temporary_directory.joinpath(self.identifier)
+        return os.path.join(self.temporary_directory, self.identifier)
 
     @property
-    def working_directory(self) -> Path:
+    def working_directory(self) -> str:
         """Working directory"""
         return self.corpus_output_directory
 
@@ -319,6 +322,11 @@ class DictionaryTextCorpus(DictionaryTextCorpusMixin, MfaWorker, TemporaryDirect
     Standalone class for working with text corpora and pronunciation dictionaries
 
     Most MFA functionality will use the :class:`~montreal_forced_aligner.corpus.text_corpus.DictionaryTextCorpusMixin` class rather than this class.
+
+    Parameters
+    ----------
+    num_jobs: int
+        Number of jobs to use when loading the corpus
 
     See Also
     --------
@@ -330,8 +338,9 @@ class DictionaryTextCorpus(DictionaryTextCorpusMixin, MfaWorker, TemporaryDirect
         For temporary directory parameters
     """
 
-    def __init__(self, **kwargs):
+    def __init__(self, num_jobs=3, **kwargs):
         super().__init__(**kwargs)
+        self.num_jobs = num_jobs
 
     @property
     def identifier(self) -> str:
@@ -339,11 +348,11 @@ class DictionaryTextCorpus(DictionaryTextCorpusMixin, MfaWorker, TemporaryDirect
         return self.data_source_identifier
 
     @property
-    def output_directory(self) -> Path:
+    def output_directory(self) -> str:
         """Root temporary directory to store all corpus and dictionary files"""
-        return GLOBAL_CONFIG.current_profile.temporary_directory.joinpath(self.identifier)
+        return os.path.join(self.temporary_directory, self.identifier)
 
     @property
-    def working_directory(self) -> Path:
+    def working_directory(self) -> str:
         """Working directory"""
         return self.corpus_output_directory

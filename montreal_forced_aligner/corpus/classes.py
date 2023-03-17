@@ -11,6 +11,7 @@ from praatio import textgrid
 
 from montreal_forced_aligner.corpus.helper import get_wav_info, load_text
 from montreal_forced_aligner.data import SoundFileInformation, TextFileType
+from montreal_forced_aligner.dictionary.multispeaker import MultispeakerSanitizationFunction
 from montreal_forced_aligner.exceptions import TextGridParseError, TextParseError
 
 if TYPE_CHECKING:
@@ -61,6 +62,7 @@ class FileData:
         text_path: Optional[str],
         relative_path: str,
         speaker_characters: Union[int, str],
+        sanitize_function: Optional[MultispeakerSanitizationFunction] = None,
         enforce_sample_rate: Optional[int] = None,
     ):
         """
@@ -117,12 +119,14 @@ class FileData:
             root_speaker = speaker_name
         file.load_text(
             root_speaker=root_speaker,
+            sanitize_function=sanitize_function,
         )
         return file
 
     def load_text(
         self,
         root_speaker: Optional[str] = None,
+        sanitize_function: Optional[MultispeakerSanitizationFunction] = None,
     ) -> None:
         """
         Load the transcription text from the text_file of the object
@@ -131,6 +135,8 @@ class FileData:
         ----------
         root_speaker: str, optional
             Speaker derived from the root directory, ignored for TextGrids
+        sanitize_function: :class:`~montreal_forced_aligner.dictionary.mixins.SanitizeFunction`, optional
+            Function to sanitize words and strip punctuation
         """
         if self.text_type == TextFileType.LAB:
             try:
@@ -149,6 +155,7 @@ class FileData:
                 channel=0,
                 end=end,
             )
+            utterance.parse_transcription(sanitize_function)
             self.utterances.append(utterance)
             self.speaker_ordering.append(root_speaker)
         elif self.text_type == TextFileType.TEXTGRID:
@@ -161,17 +168,11 @@ class FileData:
                     "\n".join(traceback.format_exception(exc_type, exc_value, exc_traceback)),
                 )
 
-            num_tiers = len(tg.tierNames)
+            num_tiers = len(tg.tierNameList)
             if num_tiers == 0:
                 raise TextGridParseError(self.text_path, "Number of tiers parsed was zero")
-            num_channels = 1
-            if self.wav_info is not None:
-                duration = self.wav_info.duration
-                num_channels = self.wav_info.num_channels
-            else:
-                duration = tg.maxTimestamp
-            for i, tier_name in enumerate(tg.tierNames):
-                ti = tg._tierDict[tier_name]
+            for i, tier_name in enumerate(tg.tierNameList):
+                ti = tg.tierDict[tier_name]
                 if tier_name.lower() == "notes":
                     continue
                 if not isinstance(ti, textgrid.IntervalTier):
@@ -181,17 +182,21 @@ class FileData:
                     self.speaker_ordering.append(speaker_name)
                 else:
                     speaker_name = root_speaker
-                channel = 0
-                if num_channels == 2 and i >= num_tiers / 2:
-                    channel = 1
-                for begin, end, text in ti.entries:
-                    text = text.strip()
+                num_channels = 1
+                if self.wav_info is not None:
+                    duration = self.wav_info.duration
+                    num_channels = self.wav_info.num_channels
+                else:
+                    duration = tg.maxTimestamp
+                for begin, end, text in ti.entryList:
+                    text = text.lower().strip()
                     if not text:
                         continue
                     begin, end = round(begin, 4), round(end, 4)
-                    if begin >= duration:
-                        continue
                     end = min(end, duration)
+                    channel = 0
+                    if num_channels == 2 and i >= i / len(tg.tierNameList):
+                        channel = 1
                     utt = UtteranceData(
                         speaker_name=speaker_name,
                         file_name=self.name,
@@ -200,6 +205,7 @@ class FileData:
                         text=text,
                         channel=channel,
                     )
+                    utt.parse_transcription(sanitize_function)
                     if not utt.text:
                         continue
                     self.utterances.append(utt)
@@ -238,6 +244,8 @@ class UtteranceData:
         Sound file channel
     text: str, optional
         Utterance text
+    normalized_text: list[str]
+        Normalized utterance text, with compounds and clitics split up
     oovs: set[str]
         Set of words not found in a look up
     """
@@ -250,4 +258,56 @@ class UtteranceData:
     text: str = ""
     normalized_text: str = ""
     normalized_character_text: str = ""
+    normalized_text_int: str = ""
+    normalized_character_text_int: str = ""
     oovs: str = ""
+
+    def parse_transcription(self, sanitize_function=Optional[MultispeakerSanitizationFunction]):
+        """
+        Parse an orthographic transcription given punctuation and clitic markers
+
+        Parameters
+        ----------
+        sanitize_function: :class:`~montreal_forced_aligner.dictionary.multispeaker.MultispeakerSanitizationFunction`, optional
+            Function to sanitize words and strip punctuation
+
+        """
+        oovs = set()
+        normalized_text = []
+        normalized_character_text = []
+        normalized_text_int = []
+        normalized_character_text_int = []
+        if not self.text:
+            return
+        if sanitize_function is not None:
+            try:
+                sanitize, split = sanitize_function.get_functions_for_speaker(self.speaker_name)
+            except AttributeError:
+                sanitize = sanitize_function
+                split = None
+            words = sanitize(self.text)
+            if split is not None:
+                text = ""
+                for w in words:
+                    for new_w in split(w):
+                        if new_w in split.specials_set or (
+                            split.word_mapping is not None and new_w not in split.word_mapping
+                        ):
+                            oovs.add(new_w)
+                        normalized_text.append(new_w)
+                        if split.word_mapping is not None:
+                            normalized_text_int.append(str(split.to_int(new_w)))
+                    if normalized_character_text:
+                        normalized_character_text.append("<space>")
+                        normalized_character_text_int.append(str(split.grapheme_to_int("<space>")))
+                    for c in split.parse_graphemes(w):
+                        normalized_character_text.append(c)
+                        normalized_character_text_int.append(str(split.grapheme_to_int(c)))
+                    if text:
+                        text += " "
+                    text += w
+                self.oovs = " ".join(sorted(oovs))
+                self.normalized_text = " ".join(normalized_text)
+                self.normalized_character_text = " ".join(normalized_character_text)
+                self.normalized_text_int = " ".join(normalized_text_int)
+                self.normalized_character_text_int = " ".join(normalized_character_text_int)

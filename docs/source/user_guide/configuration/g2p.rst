@@ -18,6 +18,7 @@ Global options
    "clitic_markers", "'''’", "Characters to treat as clitic markers, will be collapsed to the first character in the string"
    "compound_markers", "\-", "Characters to treat as marker in compound words (i.e., doesn't need to be preserved like for clitics)"
    "num_pronunciations", 1, "Number of pronunciations to generate"
+   "use_mp", True, "Flag for whether to use multiprocessing"
 
 
 .. _train_g2p_config:
@@ -56,6 +57,7 @@ Default G2P training config file
    clitic_markers: "'’"
    compound_markers: "-"
    num_pronunciations: 1  # Used if running in validation mode
+   use_mp: True
    order: 7
    random_starts: 25
    seed: 1917
@@ -79,3 +81,4 @@ Default dictionary generation config file
    clitic_markers: "'’"
    compound_markers: "-"
    num_pronunciations: 1
+   use_mp: True

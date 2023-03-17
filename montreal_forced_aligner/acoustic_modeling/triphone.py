@@ -1,20 +1,17 @@
 """Class definitions for TriphoneTrainer"""
 from __future__ import annotations
 
-import logging
 import multiprocessing as mp
 import os
 import re
 import subprocess
 import typing
-from pathlib import Path
 from queue import Empty
 from typing import TYPE_CHECKING, Dict, List
 
-from tqdm.rich import tqdm
+import tqdm
 
 from montreal_forced_aligner.acoustic_modeling.base import AcousticModelTrainingMixin
-from montreal_forced_aligner.config import GLOBAL_CONFIG
 from montreal_forced_aligner.data import MfaArguments
 from montreal_forced_aligner.helper import mfa_open
 from montreal_forced_aligner.utils import (
@@ -38,29 +35,27 @@ __all__ = [
     "ConvertAlignmentsArguments",
 ]
 
-logger = logging.getLogger("mfa")
-
 
 class TreeStatsArguments(MfaArguments):
     """Arguments for :func:`~montreal_forced_aligner.acoustic_modeling.triphone.tree_stats_func`"""
 
     dictionaries: List[str]
     ci_phones: str
-    model_path: Path
+    model_path: str
     feature_strings: Dict[str, str]
-    ali_paths: Dict[str, Path]
-    treeacc_paths: Dict[str, Path]
+    ali_paths: Dict[str, str]
+    treeacc_paths: Dict[str, str]
 
 
 class ConvertAlignmentsArguments(MfaArguments):
     """Arguments for :func:`~montreal_forced_aligner.acoustic_modeling.triphone.ConvertAlignmentsFunction`"""
 
     dictionaries: List[str]
-    model_path: Path
-    tree_path: Path
-    align_model_path: Path
-    ali_paths: Dict[str, Path]
-    new_ali_paths: Dict[str, Path]
+    model_path: str
+    tree_path: str
+    align_model_path: str
+    ali_paths: Dict[str, str]
+    new_ali_paths: Dict[str, str]
 
 
 class ConvertAlignmentsFunction(KaldiFunction):
@@ -216,39 +211,23 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
         list[:class:`~montreal_forced_aligner.acoustic_modeling.triphone.TreeStatsArguments`]
             Arguments for processing
         """
+        feat_strings = self.worker.construct_feature_proc_strings()
         alignment_model_path = os.path.join(self.previous_aligner.working_directory, "final.mdl")
-        arguments = []
-        for j in self.jobs:
-            feat_strings = {}
-            ali_paths = {}
-            treeacc_paths = {}
-            for d_id in j.dictionary_ids:
-                feat_strings[d_id] = j.construct_feature_proc_string(
-                    self.working_directory,
-                    d_id,
-                    self.feature_options["uses_splices"],
-                    self.feature_options["splice_left_context"],
-                    self.feature_options["splice_right_context"],
-                    self.feature_options["uses_speaker_adaptation"],
-                )
-                ali_paths[d_id] = j.construct_path(
-                    self.previous_aligner.working_directory, "ali", "ark", d_id
-                )
-                treeacc_paths[d_id] = j.construct_path(self.working_directory, "tree", "acc", d_id)
-            arguments.append(
-                TreeStatsArguments(
-                    j.id,
-                    getattr(self, "db_string", ""),
-                    self.working_log_directory.joinpath(f"acc_tree.{j.id}.log"),
-                    j.dictionary_ids,
-                    self.worker.context_independent_csl,
-                    alignment_model_path,
-                    feat_strings,
-                    ali_paths,
-                    treeacc_paths,
-                )
+        return [
+            TreeStatsArguments(
+                j.name,
+                getattr(self, "db_path", ""),
+                os.path.join(self.working_log_directory, f"acc_tree.{j.name}.log"),
+                j.dictionary_ids,
+                self.worker.context_independent_csl,
+                alignment_model_path,
+                feat_strings[j.name],
+                j.construct_path_dictionary(self.previous_aligner.working_directory, "ali", "ark"),
+                j.construct_path_dictionary(self.working_directory, "tree", "acc"),
             )
-        return arguments
+            for j in self.jobs
+            if j.has_data
+        ]
 
     def convert_alignments_arguments(self) -> List[ConvertAlignmentsArguments]:
         """
@@ -261,9 +240,9 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
         """
         return [
             ConvertAlignmentsArguments(
-                j.id,
-                getattr(self, "db_string", ""),
-                self.working_log_directory.joinpath(f"convert_alignments.{j.id}.log"),
+                j.name,
+                getattr(self, "db_path", ""),
+                os.path.join(self.working_log_directory, f"convert_alignments.{j.name}.log"),
                 j.dictionary_ids,
                 self.model_path,
                 self.tree_path,
@@ -272,6 +251,7 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
                 j.construct_path_dictionary(self.working_directory, "ali", "ark"),
             )
             for j in self.jobs
+            if j.has_data
         ]
 
     def convert_alignments(self) -> None:
@@ -292,10 +272,12 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
             Reference Kaldi script
 
         """
-        logger.info("Converting alignments...")
+        self.log_info("Converting alignments...")
         arguments = self.convert_alignments_arguments()
-        with tqdm(total=self.num_current_utterances, disable=GLOBAL_CONFIG.quiet) as pbar:
-            if GLOBAL_CONFIG.use_mp:
+        with tqdm.tqdm(
+            total=self.num_current_utterances, disable=getattr(self, "quiet", False)
+        ) as pbar:
+            if self.use_mp:
                 error_dict = {}
                 return_queue = mp.Queue()
                 stopped = Stopped()
@@ -395,7 +377,7 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
         """
 
         jobs = self.tree_stats_arguments()
-        if GLOBAL_CONFIG.use_mp:
+        if self.use_mp:
             run_mp(tree_stats_func, jobs, self.working_log_directory)
         else:
             run_non_mp(tree_stats_func, jobs, self.working_log_directory)
@@ -403,17 +385,17 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
         tree_accs = []
         for x in jobs:
             tree_accs.extend(x.treeacc_paths.values())
-        log_path = self.working_log_directory.joinpath("sum_tree_acc.log")
+        log_path = os.path.join(self.working_log_directory, "sum_tree_acc.log")
         with mfa_open(log_path, "w") as log_file:
             subprocess.call(
                 [
                     thirdparty_binary("sum-tree-stats"),
-                    self.working_directory.joinpath("treeacc"),
+                    os.path.join(self.working_directory, "treeacc"),
                 ]
                 + tree_accs,
                 stderr=log_file,
             )
-        if not GLOBAL_CONFIG.debug:
+        if not self.debug:
             for f in tree_accs:
                 os.remove(f)
 
@@ -426,15 +408,15 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
         :class:`~montreal_forced_aligner.exceptions.KaldiProcessingError`
             If there were any errors in running Kaldi binaries
         """
-        log_path = self.working_log_directory.joinpath("questions.log")
-        tree_path = self.working_directory.joinpath("tree")
-        treeacc_path = self.working_directory.joinpath("treeacc")
+        log_path = os.path.join(self.working_log_directory, "questions.log")
+        tree_path = os.path.join(self.working_directory, "tree")
+        treeacc_path = os.path.join(self.working_directory, "treeacc")
         sets_int_path = os.path.join(self.worker.phones_dir, "sets.int")
         roots_int_path = os.path.join(self.worker.phones_dir, "roots.int")
         extra_question_int_path = os.path.join(self.worker.phones_dir, "extra_questions.int")
         topo_path = self.worker.topo_path
-        questions_path = self.working_directory.joinpath("questions.int")
-        questions_qst_path = self.working_directory.joinpath("questions.qst")
+        questions_path = os.path.join(self.working_directory, "questions.int")
+        questions_qst_path = os.path.join(self.working_directory, "questions.qst")
         with mfa_open(log_path, "w") as log_file:
             subprocess.call(
                 [
@@ -450,7 +432,7 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
             for line in inf:
                 outf.write(line)
 
-        log_path = self.working_log_directory.joinpath("compile_questions.log")
+        log_path = os.path.join(self.working_log_directory, "compile_questions.log")
         with mfa_open(log_path, "w") as log_file:
             subprocess.call(
                 [
@@ -462,7 +444,7 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
                 stderr=log_file,
             )
 
-        log_path = self.working_log_directory.joinpath("build_tree.log")
+        log_path = os.path.join(self.working_log_directory, "build_tree.log")
         with mfa_open(log_path, "w") as log_file:
             subprocess.call(
                 [
@@ -479,8 +461,8 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
                 stderr=log_file,
             )
 
-        log_path = self.working_log_directory.joinpath("init_model.log")
-        occs_path = self.working_directory.joinpath("0.occs")
+        log_path = os.path.join(self.working_log_directory, "init_model.log")
+        occs_path = os.path.join(self.working_directory, "0.occs")
         mdl_path = self.model_path
         if init_from_previous:
             command = [
@@ -522,7 +504,7 @@ class TriphoneTrainer(AcousticModelTrainingMixin):
                     occs_path,
                     mdl_path,
                 ]
-            log_path = self.working_log_directory.joinpath("mixup.log")
+            log_path = os.path.join(self.working_log_directory, "mixup.log")
             with mfa_open(log_path, "w") as log_file:
                 subprocess.call(command, stderr=log_file)
         os.remove(treeacc_path)

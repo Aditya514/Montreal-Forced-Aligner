@@ -6,36 +6,22 @@ dependencies:
   - librosa
   - tqdm
   - requests
-  - pyyaml
-  - praatio=6.0.0
-  - dataclassy
-  - sqlalchemy>=2.0
-  - pynini
-  - pgvector
-  - pgvector-python
-  - postgresql
-  - hdbscan
-  - psycopg2
-  - biopython=1.79
-  - click
+  - colorama
   - setuptools_scm
-  - importlib_metadata
+  - ansiwrap
+  - pyyaml
+  - praatio
+  - dataclassy
+  - sqlalchemy>=1.4
+  - pip
+  - pynini
+  - biopython
   - sphinx
   - numpydoc
   - sphinx-design
-  - sphinx-click
-  - sphinx-intl
+  - sphinxcontrib-autoprogram
   - pydata-sphinx-theme
-  - myst-parser
-  - mock
-  - setuptools-scm
-  - numba
-  - kneed
-  - matplotlib
-  - seaborn
-  - rich
-  - rich-click
+  - interrogate
+  - importlib_metadata
   - pip:
-      - sphinx-needs
-      - sphinxcontrib-plantuml
-      - pygls<1.0.0
+      - sphinxemoji

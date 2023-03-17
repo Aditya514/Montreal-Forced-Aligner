@@ -7,17 +7,19 @@ from __future__ import annotations
 
 import datetime
 import logging
+import re
 import sys
 import typing
-from pathlib import Path
 from typing import TYPE_CHECKING, Collection, Dict, List, Optional
 
 import requests.structures
 
-from montreal_forced_aligner.helper import comma_join
+from montreal_forced_aligner.helper import TerminalPrinter, comma_join
 
 if TYPE_CHECKING:
-    from montreal_forced_aligner.data import CtmInterval
+    from montreal_forced_aligner.dictionary.mixins import DictionaryMixin
+    from montreal_forced_aligner.models import G2PModel
+    from montreal_forced_aligner.textgrid import CtmInterval
 
 
 __all__ = [
@@ -36,6 +38,7 @@ __all__ = [
     "CorpusError",
     "ModelLoadError",
     "CorpusReadError",
+    "ArgumentError",
     "AlignerError",
     "AlignmentError",
     "AlignmentExportError",
@@ -52,7 +55,7 @@ __all__ = [
     "MultipleModelTypesFoundError",
     "ModelTypeNotSupportedError",
     "PronunciationAcousticMismatchError",
-    "RootDirectoryError",
+    "PronunciationOrthographyMismatchError",
 ]
 
 
@@ -62,17 +65,20 @@ class MFAError(Exception):
     """
 
     def __init__(self, base_error_message: str, *args, **kwargs):
+        self.printer = TerminalPrinter()
         self.message_lines: List[str] = [base_error_message]
 
     @property
     def message(self) -> str:
         """Formatted exception message"""
-        return "\n".join(self.message_lines)
+        return "\n".join(self.printer.format_info_lines(self.message_lines))
 
     def __str__(self) -> str:
         """Output the error"""
-        message = type(self).__name__ + ":"
+        message = self.printer.error_text(type(self).__name__) + ":"
+        self.printer.indent_level += 1
         message += "\n\n" + self.message
+        self.printer.indent_level -= 1
         return message
 
 
@@ -89,12 +95,12 @@ class PlatformError(MFAError):
     def __init__(self, functionality_name):
         super().__init__("")
         self.message_lines = [
-            f"Functionality for {functionality_name} is not available on {sys.platform}."
+            f"Functionality for {self.printer.emphasized_text(functionality_name)} is not available on {self.printer.error_text(sys.platform)}."
         ]
         if sys.platform == "win32":
             self.message_lines.append("")
             self.message_lines.append(
-                f" If you'd like to use {functionality_name} on Windows, please follow the MFA installation "
+                f" If you'd like to use {self.printer.emphasized_text(functionality_name)} on Windows, please follow the MFA installation "
                 f"instructions for the Windows Subsystem for Linux (WSL)."
             )
 
@@ -123,49 +129,40 @@ class ThirdpartyError(MFAError):
         super().__init__("")
         if error_text:
             self.message_lines = [
-                f"There was an error when invoking '{binary_name}':",
+                f"There was an error when invoking '{self.printer.error_text(binary_name)}':",
                 error_text,
                 "This likely indicates that MFA's dependencies were not correctly installed, or there is an issue with your Conda environment.",
                 "If you are in the correct environment, please try re-creating the environment from scratch as a first step, i.e.:",
-                "conda create -n aligner -c conda-forge montreal-forced-aligner",
+                self.printer.pass_text(
+                    "conda create -n aligner -c conda-forge montreal-forced-aligner"
+                ),
             ]
         else:
-            self.message_lines = [f"Could not find '{binary_name}'."]
+            self.message_lines = [f"Could not find '{self.printer.error_text(binary_name)}'."]
             self.message_lines.append(
                 "Please ensure that you have installed MFA's conda dependencies and are in the correct environment."
             )
             if open_fst:
                 self.message_lines.append(
-                    f"Please ensure that you are in an environment that has the {'openfst'} conda package installed, "
-                    f"or that the {'openfst'} binaries are on your path if you compiled them yourself."
+                    f"Please ensure that you are in an environment that has the {self.printer.emphasized_text('openfst')} conda package installed, "
+                    f"or that the {self.printer.emphasized_text('openfst')} binaries are on your path if you compiled them yourself."
                 )
             elif open_blas:
                 self.message_lines.append(
-                    f"Try installing {'openblas'} via system package manager or verify it's on your system path?"
+                    f"Try installing {self.printer.emphasized_text('openblas')} via system package manager or verify it's on your system path?"
                 )
             elif libc:
                 self.message_lines.append(
-                    f"You likely have a different version of {'glibc'} than the packages binaries use. "
-                    f"Try compiling {'Kaldi'} on your machine and collecting the binaries via the "
-                    f"{'mfa thirdparty kaldi'} command."
+                    f"You likely have a different version of {self.printer.emphasized_text('glibc')} than the packages binaries use. "
+                    f"Try compiling {self.printer.emphasized_text('Kaldi')} on your machine and collecting the binaries via the "
+                    f"{self.printer.pass_text('mfa thirdparty kaldi')} command."
                 )
             elif sox:
                 self.message_lines = []
                 self.message_lines.append(
-                    f"Your version of {'sox'} does not support the file format in your corpus. "
-                    f"Try installing another version of {'sox'} with support for {binary_name}."
+                    f"Your version of {self.printer.emphasized_text('sox')} does not support the file format in your corpus. "
+                    f"Try installing another version of {self.printer.emphasized_text('sox')} with support for {self.printer.error_text(binary_name)}."
                 )
-
-
-# Feature Generation Errors
-
-
-class FeatureGenerationError(MFAError):
-    """
-    Exception class related to generating features
-    """
-
-    pass
 
 
 # Model Errors
@@ -185,30 +182,14 @@ class ModelLoadError(ModelError):
 
     Parameters
     ----------
-    path: :class:`~pathlib.Path`
+    path: str
         Path of the model archive
     """
 
-    def __init__(self, path: typing.Union[str, Path]):
-        super().__init__("")
-        self.message_lines = [f"The archive {path} could not be parsed as an MFA model."]
-
-
-class ModelSaveError(ModelError):
-    """
-    Exception during saving of a model archive
-
-    Parameters
-    ----------
-    path: :class:`~pathlib.Path`
-        Path of the model archive
-    """
-
-    def __init__(self, path: Path):
+    def __init__(self, path: str):
         super().__init__("")
         self.message_lines = [
-            f"The archive {path} already exists.",
-            "Please specify --overwrite if you would like to overwrite  it.",
+            f"The archive {self.printer.error_text(path)} could not be parsed as an MFA model"
         ]
 
 
@@ -237,9 +218,9 @@ class ModelsConnectionError(ModelError):
             rate_limit = headers["x-ratelimit-limit"]
             rate_limit_reset = datetime.datetime.fromtimestamp(int(headers["x-ratelimit-reset"]))
             self.message_lines = [
-                f"Current hourly rate limit ({rate_limit} per hour) has been exceeded for the GitHub API.",
+                f"Current hourly rate limit ({self.printer.error_text(rate_limit)} per hour) has been exceeded for the GitHub API.",
                 "You can increase it by providing a personal authentication token to via --github_token.",
-                f"The rate limit will reset at {rate_limit_reset}",
+                f"The rate limit will reset at {self.printer.pass_text(rate_limit_reset)}",
             ]
         else:
             self.message_lines = [
@@ -258,22 +239,6 @@ class DictionaryError(MFAError):
     pass
 
 
-class PhoneMismatchError(DictionaryError):
-    """
-    Exception class for when a dictionary receives a new phone
-
-    Parameters
-    ----------
-    missing_phones: Collection[str]
-        Phones that are not in the acoustic model
-    """
-
-    def __init__(self, missing_phones: Collection[str]):
-        super().__init__("There were extra phones that were not in the dictionary: ")
-        missing_phones = [f"{x}" for x in sorted(missing_phones)]
-        self.message_lines.append(comma_join(missing_phones))
-
-
 class NoDefaultSpeakerDictionaryError(DictionaryError):
     """
     Exception class for errors in creating MultispeakerDictionary objects
@@ -281,7 +246,7 @@ class NoDefaultSpeakerDictionaryError(DictionaryError):
 
     def __init__(self):
         super().__init__("")
-        self.message_lines = [f'No "{"default"}" dictionary was found.']
+        self.message_lines = [f'No "{self.printer.error_text("default")}" dictionary was found.']
 
 
 class DictionaryPathError(DictionaryError):
@@ -290,14 +255,14 @@ class DictionaryPathError(DictionaryError):
 
     Parameters
     ----------
-    input_path: :class:`~pathlib.Path`
+    input_path: str
         Path of the pronunciation dictionary
     """
 
-    def __init__(self, input_path: Path):
+    def __init__(self, input_path: str):
         super().__init__("")
         self.message_lines = [
-            f"The specified path for the dictionary ({input_path}) was not found."
+            f"The specified path for the dictionary ({self.printer.error_text(input_path)}) was not found."
         ]
 
 
@@ -307,14 +272,14 @@ class DictionaryFileError(DictionaryError):
 
     Parameters
     ----------
-    input_path: :class:`~pathlib.Path`
+    input_path: str
         Path of the pronunciation dictionary
     """
 
-    def __init__(self, input_path: Path):
+    def __init__(self, input_path: str):
         super().__init__("")
         self.message_lines = [
-            f"The specified path for the dictionary ({input_path}) is not a file."
+            f"The specified path for the dictionary ({self.printer.error_text(input_path)}) is not a file."
         ]
 
 
@@ -341,7 +306,7 @@ class CorpusReadError(CorpusError):
 
     def __init__(self, file_name: str):
         super().__init__("")
-        self.message_lines = [f"There was an error reading {file_name}."]
+        self.message_lines = [f"There was an error reading {self.printer.error_text(file_name)}."]
 
 
 class TextParseError(CorpusReadError):
@@ -357,7 +322,8 @@ class TextParseError(CorpusReadError):
     def __init__(self, file_name: str):
         super().__init__("")
         self.message_lines = [
-            f"There was an error decoding {file_name}, maybe try re-saving it as utf8?"
+            f"There was an error decoding {self.printer.error_text(file_name)}, "
+            f"maybe try resaving it as utf8?"
         ]
 
 
@@ -379,7 +345,7 @@ class TextGridParseError(CorpusReadError):
         self.error = error
         self.message_lines.extend(
             [
-                f"Reading {file_name} has the following error:",
+                f"Reading {self.printer.emphasized_text(file_name)} has the following error:",
                 "",
                 "",
                 self.error,
@@ -407,13 +373,13 @@ class SoundFileError(CorpusReadError):
         Error in TextGrid file
     """
 
-    def __init__(self, file_name: typing.Union[str, Path], error: str):
+    def __init__(self, file_name: str, error: str):
         super().__init__("")
         self.file_name = file_name
         self.error = error
         self.message_lines.extend(
             [
-                f"Reading {file_name} has the following error:",
+                f"Reading {self.printer.emphasized_text(file_name)} has the following error:",
                 "",
                 "",
                 self.error,
@@ -447,7 +413,7 @@ class NoAlignmentsError(MFAError):
         suggested_beam_size = beam_size * 10
         suggested_retry_beam_size = suggested_beam_size * 4
         self.message_lines.append(
-            f'You can try rerunning with a larger beam (i.e. "mfa align ... --beam {suggested_beam_size} --retry_beam {suggested_retry_beam_size}").'
+            f'You can try rerunning with a larger beam (i.e. "mfa align ... --beam={suggested_beam_size} --retry_beam={suggested_retry_beam_size}").'
         )
         self.message_lines.append(
             'If increasing the beam size does not help, then there are likely issues with the corpus, dictionary, or acoustic model, and can be further diagnosed with the "mfa validate" command'
@@ -467,13 +433,13 @@ class AlignmentError(MFAError):
     def __init__(self, error_logs: List[str]):
         super().__init__("")
         self.message_lines = [
-            f"There were {len(error_logs)} job(s) with errors. "
+            f"There were {self.printer.error_text(len(error_logs))} job(s) with errors. "
             f"For more information, please see:",
             "",
             "",
         ]
         for path in error_logs:
-            self.message_lines.append(path)
+            self.message_lines.append(self.printer.error_text(path))
 
 
 class AlignmentExportError(AlignmentError):
@@ -482,13 +448,12 @@ class AlignmentExportError(AlignmentError):
 
     Parameters
     ----------
-    path: :class:`pathlib.Path`
-        Path for export
-    error_lines: list[str]
-        Lines in the error message
+    error_dict: dict[tuple[str, int], str]
+        Error dictionary mapping export stage and job to the error encountered
+
     """
 
-    def __init__(self, path: Path, error_lines: List[str]):
+    def __init__(self, path: str, error_lines: List[str]):
         MFAError.__init__(self, f"Error was encountered in exporting {path}:")
         self.path = path
         self.message_lines.append("")
@@ -532,8 +497,29 @@ class PronunciationAcousticMismatchError(AlignerError):
 
     def __init__(self, missing_phones: Collection[str]):
         super().__init__("There were phones in the dictionary that do not have acoustic models: ")
-        missing_phones = [f"{x}" for x in sorted(missing_phones)]
+        missing_phones = [f"{self.printer.error_text(x)}" for x in sorted(missing_phones)]
         self.message_lines.append(comma_join(missing_phones))
+
+
+class PronunciationOrthographyMismatchError(AlignerError):
+    """
+    Exception class for missing graphemes in a G2P model
+
+    Parameters
+    ----------
+    g2p_model: :class:`~montreal_forced_aligner.models.G2PModel`
+        Specified G2P model
+    dictionary: :class:`~montreal_forced_aligner.dictionary.mixins.DictionaryMixin`
+        Specified dictionary
+    """
+
+    def __init__(self, g2p_model: G2PModel, dictionary: DictionaryMixin):
+        super().__init__(
+            "There were graphemes in the corpus that are not covered by the G2P model:"
+        )
+        missing_graphs = dictionary.graphemes - set(g2p_model.meta["graphemes"])
+        missing_graphs = [f"{self.printer.error_text(x)}" for x in sorted(missing_graphs)]
+        self.message_lines.append(comma_join(missing_graphs))
 
 
 # Command line exceptions
@@ -553,13 +539,13 @@ class FileArgumentNotFoundError(ArgumentError):
 
     Parameters
     ----------
-    path: :class:`~pathlib.Path`
+    path: str
         Path not found
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path):
         super().__init__("")
-        self.message_lines = [f'Could not find "{path}".']
+        self.message_lines = [f'Could not find "{self.printer.error_text(path)}".']
 
 
 class PretrainedModelNotFoundError(ArgumentError):
@@ -583,9 +569,11 @@ class PretrainedModelNotFoundError(ArgumentError):
         extra = ""
         if model_type:
             extra += f" for {model_type}"
-        self.message_lines = [f'Could not find a model named "{name}"{extra}.']
+        self.message_lines = [
+            f'Could not find a model named "{self.printer.error_text(name)}"{extra}.'
+        ]
         if available:
-            available = [f"{x}" for x in available]
+            available = [f"{self.printer.pass_text(x)}" for x in available]
             self.message_lines.append(f"Available: {comma_join(available)}.")
 
 
@@ -610,9 +598,11 @@ class RemoteModelNotFoundError(ArgumentError):
         extra = ""
         if model_type:
             extra += f" for {model_type}"
-        self.message_lines = [f'Could not find a model named "{name}"{extra}.']
+        self.message_lines = [
+            f'Could not find a model named "{self.printer.error_text(name)}"{extra}.'
+        ]
         if available:
-            available = [f"{x}" for x in available]
+            available = [f"{self.printer.pass_text(x)}" for x in available]
             self.message_lines.append(f"Available: {comma_join(available)}.")
         self.message_lines.append(
             "You can see all available models either on https://mfa-models.readthedocs.io/en/latest/ or https://github.com/MontrealCorpusTools/mfa-models/releases."
@@ -637,8 +627,8 @@ class MultipleModelTypesFoundError(ArgumentError):
 
     def __init__(self, name: str, possible_model_types: List[str]):
         super().__init__("")
-        self.message_lines = [f'Found multiple model types for "{name}":']
-        possible_model_types = [f"{x}" for x in possible_model_types]
+        self.message_lines = [f'Found multiple model types for "{self.printer.error_text(name)}":']
+        possible_model_types = [f"{self.printer.error_text(x)}" for x in possible_model_types]
         self.message_lines.extend(
             [", ".join(possible_model_types), "Please specify a model type to inspect."]
         )
@@ -663,10 +653,12 @@ class ModelExtensionError(ArgumentError):
         extra = ""
         if model_type:
             extra += f" for {model_type}"
-        self.message_lines = [f'The path "{name}" does not have the correct extensions{extra}.']
+        self.message_lines = [
+            f'The path "{self.printer.error_text(name)}" does not have the correct extensions{extra}.'
+        ]
 
         if extensions:
-            available = [f"{x}" for x in extensions]
+            available = [f"{self.printer.pass_text(x)}" for x in extensions]
             self.message_lines.append(f" Possible extensions: {comma_join(available)}.")
 
 
@@ -684,9 +676,11 @@ class ModelTypeNotSupportedError(ArgumentError):
 
     def __init__(self, model_type, model_types):
         super().__init__("")
-        self.message_lines = [f'The model type "{model_type}" is not supported.']
+        self.message_lines = [
+            f'The model type "{self.printer.error_text(model_type)}" is not supported.'
+        ]
         if model_types:
-            model_types = [f"{x}" for x in sorted(model_types)]
+            model_types = [f"{self.printer.pass_text(x)}" for x in sorted(model_types)]
             self.message_lines.append(f" Possible model types: {comma_join(model_types)}.")
 
 
@@ -706,8 +700,8 @@ class RootDirectoryError(ConfigError):
     def __init__(self, temporary_directory, variable):
         super().__init__("")
         self.message_lines = [
-            f"Could not create a root MFA temporary directory (tried {temporary_directory}. ",
-            f"Please specify a write-able directory via the {variable} environment variable.",
+            f"Could not create a root MFA temporary directory (tried {self.printer.error_text(temporary_directory)}. ",
+            f"Please specify a write-able directory via the {self.printer.emphasized_text(variable)} environment variable.",
         ]
 
 
@@ -736,8 +730,10 @@ class PyniniAlignmentError(G2PError):
         super().__init__("The following Pynini alignment jobs encountered errors:")
         self.message_lines.extend(["", ""])
         for k, v in error_dict.items():
-            self.message_lines.append(k)
-            self.message_lines.append(str(v))
+            self.message_lines.append(self.printer.indent_string + self.printer.error_text(k))
+            self.message_lines.append(
+                self.printer.indent_string + self.printer.emphasized_text(str(v))
+            )
 
 
 class PyniniGenerationError(G2PError):
@@ -749,8 +745,10 @@ class PyniniGenerationError(G2PError):
         super().__init__("The following words had errors in running G2P:")
         self.message_lines.extend(["", ""])
         for k, v in error_dict.items():
-            self.message_lines.append(k)
-            self.message_lines.append(str(v))
+            self.message_lines.append(self.printer.indent_string + self.printer.error_text(k))
+            self.message_lines.append(
+                self.printer.indent_string + self.printer.emphasized_text(str(v))
+            )
 
 
 class PhonetisaurusSymbolError(G2PError):
@@ -780,11 +778,11 @@ class LanguageModelNotFoundError(LMError):
 
     Parameters
     ----------
-    path: :class:`~pathlib.Path`
+    path: str
         Path to missing language model
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: str):
         super().__init__(f"Could not find a suitable language model: {path}")
 
 
@@ -802,9 +800,31 @@ class MultiprocessingError(MFAError):
 
     def __init__(self, job_name: int, error_text: str):
         super().__init__(f"Job {job_name} encountered an error:")
-        self.message_lines = [f"Job {job_name} encountered an error:"]
+        self.message_lines = [f"Job {self.printer.error_text(job_name)} encountered an error:"]
         self.job_name = job_name
-        self.message_lines.extend([x for x in error_text.splitlines(keepends=False)])
+        self.message_lines.extend(
+            [self.highlight_line(x) for x in error_text.splitlines(keepends=False)]
+        )
+
+    def highlight_line(self, line: str) -> str:
+        """
+        Highlight a line in traceback
+
+        Parameters
+        ----------
+        line: str
+            Line to highlight
+
+        Returns
+        -------
+        str
+            Highlighted line
+        """
+        emph_replacement = self.printer.emphasized_text(r"\1")
+        err_replacement = self.printer.error_text(r"\1")
+        line = re.sub(r"File \"(.*)\"", f'File "{emph_replacement}"', line)
+        line = re.sub(r"line (\d+)", f"line {err_replacement}", line)
+        return line
 
 
 class KaldiProcessingError(MFAError):
@@ -819,7 +839,7 @@ class KaldiProcessingError(MFAError):
         Overall log file to find more information
     """
 
-    def __init__(self, error_logs: List[typing.Union[Path, str]], log_file: Optional[Path] = None):
+    def __init__(self, error_logs: List[str], log_file: Optional[str] = None):
         super().__init__(
             f"There were {len(error_logs)} job(s) with errors when running Kaldi binaries."
         )
@@ -830,20 +850,16 @@ class KaldiProcessingError(MFAError):
 
     def refresh_message(self) -> None:
         """Regenerate the exceptions message"""
-        from montreal_forced_aligner.config import GLOBAL_CONFIG
-
         self.message_lines = [
             f"There were {len(self.error_logs)} job(s) with errors when running Kaldi binaries.",
             "See the log files below for more information.",
         ]
         for error_log in self.error_logs:
-            self.message_lines.append(str(error_log))
-            if GLOBAL_CONFIG.current_profile.verbose:
-                with open(error_log, "r", encoding="utf8") as f:
-                    for line in f:
-                        self.message_lines.append(line.strip())
+            self.message_lines.append(error_log)
         if self.log_file:
-            self.message_lines.append(f" For more details, please check {self.log_file}")
+            self.message_lines.append(
+                f" For more details, please check {self.printer.error_text(self.log_file)}"
+            )
 
     def append_error_log(self, error_log: str) -> None:
         """
@@ -857,15 +873,15 @@ class KaldiProcessingError(MFAError):
         self.error_logs.append(error_log)
         self.refresh_message()
 
-    def update_log_file(self) -> None:
+    def update_log_file(self, logger: logging.Logger) -> None:
         """
         Update the log file output
-        """
 
-        logger = logging.getLogger("mfa")
+        Parameters
+        ----------
+        logger: logging.Logger
+            Logger
+        """
         if logger.handlers:
-            for handler in logger.handlers:
-                if isinstance(handler, logging.FileHandler):
-                    self.log_file = handler.baseFilename
-                    break
+            self.log_file = logger.handlers[0].baseFilename
         self.refresh_message()

@@ -1,3 +1,4 @@
+use_mp: false
 
 energy_threshold: 9
 energy_mean_scale: 0.5

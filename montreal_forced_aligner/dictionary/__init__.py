@@ -17,4 +17,5 @@ __all__ = [
     "SanitizeFunction",
     "MultispeakerDictionary",
     "MultispeakerDictionaryMixin",
+    "PronunciationDictionaryMixin",
 ]

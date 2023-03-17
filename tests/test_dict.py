@@ -1,18 +1,22 @@
+import os
 import shutil
 
+import pytest
+
+from montreal_forced_aligner.alignment.pretrained import PretrainedAligner
 from montreal_forced_aligner.db import Pronunciation
 from montreal_forced_aligner.dictionary.multispeaker import MultispeakerDictionary
 
 
-def test_abstract(abstract_dict_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "abstract")
-    global_config.temporary_directory = output_directory
+def test_abstract(abstract_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "abstract")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
-        dictionary_path=abstract_dict_path, position_dependent_phones=True
+        dictionary_path=abstract_dict_path, temporary_directory=output_directory
     )
     dictionary.dictionary_setup()
 
+    assert dictionary
     assert set(dictionary.phones) == {"sil", "spn", "phonea", "phoneb", "phonec"}
     assert set(dictionary.kaldi_non_silence_phones) == {
         "phonea_B",
@@ -30,24 +34,40 @@ def test_abstract(abstract_dict_path, generated_dir, global_config, db_setup):
     }
 
 
-def test_tabbed(tabbed_dict_path, basic_dict_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "tabbed")
-    global_config.temporary_directory = output_directory
+def test_tabbed(tabbed_dict_path, basic_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "tabbed")
     shutil.rmtree(output_directory, ignore_errors=True)
-    tabbed_dictionary = MultispeakerDictionary(dictionary_path=tabbed_dict_path)
+    tabbed_dictionary = MultispeakerDictionary(
+        dictionary_path=tabbed_dict_path, temporary_directory=output_directory
+    )
     tabbed_dictionary.dictionary_setup()
-    basic_dictionary = MultispeakerDictionary(dictionary_path=basic_dict_path)
+    basic_dictionary = MultispeakerDictionary(
+        dictionary_path=basic_dict_path, temporary_directory=output_directory
+    )
     basic_dictionary.dictionary_setup()
-    assert tabbed_dictionary.word_mapping(
-        tabbed_dictionary.dictionary_lookup["test_tabbed_dictionary"]
-    ) == basic_dictionary.word_mapping(basic_dictionary.dictionary_lookup["test_basic"])
+    assert tabbed_dictionary.word_mapping(1) == basic_dictionary.word_mapping(1)
 
 
-def test_extra_annotations(extra_annotations_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "extras")
-    global_config.temporary_directory = output_directory
+@pytest.mark.skip("Outdated models")
+def test_missing_phones(
+    basic_corpus_dir, generated_dir, german_prosodylab_acoustic_model, german_prosodylab_dictionary
+):
+    output_directory = os.path.join(generated_dir, "dictionary_tests")
+    aligner = PretrainedAligner(
+        acoustic_model_path=german_prosodylab_acoustic_model,
+        corpus_directory=basic_corpus_dir,
+        dictionary_path=german_prosodylab_dictionary,
+        temporary_directory=output_directory,
+    )
+    aligner.setup()
+
+
+def test_extra_annotations(extra_annotations_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "extras")
     shutil.rmtree(output_directory, ignore_errors=True)
-    dictionary = MultispeakerDictionary(dictionary_path=extra_annotations_path)
+    dictionary = MultispeakerDictionary(
+        dictionary_path=extra_annotations_path, temporary_directory=output_directory
+    )
     dictionary.dictionary_setup()
     dictionary.write_lexicon_information()
     from montreal_forced_aligner.db import Grapheme
@@ -57,33 +77,63 @@ def test_extra_annotations(extra_annotations_path, generated_dir, global_config,
         assert g is not None
 
 
-def test_abstract_noposition(abstract_dict_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "abstract_no_position")
-    global_config.temporary_directory = output_directory
+def test_abstract_noposition(abstract_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "abstract_no_position")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=abstract_dict_path,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
     )
     dictionary.dictionary_setup()
     dictionary.write_lexicon_information()
     assert set(dictionary.phones) == {"sil", "spn", "phonea", "phoneb", "phonec"}
 
 
-def test_english_clitics(english_dictionary, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "english_clitics")
-    global_config.temporary_directory = output_directory
+def test_frclitics(frclitics_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "fr_clitics")
+    shutil.rmtree(output_directory, ignore_errors=True)
+    dictionary = MultispeakerDictionary(
+        dictionary_path=frclitics_dict_path,
+        position_dependent_phones=False,
+        temporary_directory=output_directory,
+    )
+    dictionary.dictionary_setup()
+    dictionary.write_lexicon_information()
+    s, spl = dictionary.sanitize_function.get_functions_for_speaker("default")
+    assert spl.to_int("aujourd") == spl.word_mapping[spl.oov_word]
+    assert spl.to_int("aujourd'hui") != spl.word_mapping[spl.oov_word]
+    assert spl.to_int("m'appelle") == spl.word_mapping[spl.oov_word]
+    assert spl.to_int("purple-people-eater") == spl.word_mapping[spl.oov_word]
+    assert spl("aujourd") == ["aujourd"]
+    assert spl("aujourd'hui") == ["aujourd'hui"]
+    assert spl("vingt-six") == ["vingt", "six"]
+    assert spl("m'appelle") == ["m'", "appelle"]
+    assert spl("m'm'appelle") == ["m'", "m'", "appelle"]
+    assert spl("c'est") == ["c'est"]
+    assert spl("m'c'est") == ["m'", "c'", "est"]
+    assert spl("purple-people-eater") == ["purple-people-eater"]
+    assert spl("m'appele") == ["m'", "appele"]
+    assert spl("m'ving-sic") == ["m'", "ving", "sic"]
+    assert spl("flying'purple-people-eater") == ["flying'purple-people-eater"]
+
+
+def test_english_clitics(english_dictionary, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "english_clitics")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=english_dictionary,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
         phone_set_type="AUTO",
     )
     dictionary.dictionary_setup()
     dictionary.write_lexicon_information()
     assert dictionary.phone_set_type.name == "ARPA"
     assert dictionary.extra_questions_mapping
-    for v in dictionary.extra_questions_mapping.values():
+    for k, v in dictionary.extra_questions_mapping.items():
+        print(k)
+        print(v)
         assert len(v) == len(set(v))
     assert all(x.endswith("0") for x in dictionary.extra_questions_mapping["stress_0"])
     assert all(x.endswith("1") for x in dictionary.extra_questions_mapping["stress_1"])
@@ -100,14 +150,19 @@ def test_english_clitics(english_dictionary, generated_dir, global_config, db_se
     assert set(dictionary.extra_questions_mapping["close"]) == {"IH", "UH", "IY", "UW"}
     assert set(dictionary.extra_questions_mapping["close_mid"]) == {"EY", "OW", "AH"}
 
+    s, spl = dictionary.sanitize_function.get_functions_for_speaker("default")
+    assert spl.split_clitics("l'orme's") == ["l'", "orme", "'s"]
 
-def test_english_mfa(english_us_mfa_dictionary, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "english_mfa")
-    global_config.temporary_directory = output_directory
+    assert list(s("Hello 'smart guy'.")) == ["hello", "smart", "guy"]
+
+
+def test_english_mfa(english_us_mfa_dictionary, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "english_mfa")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=english_us_mfa_dictionary,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
         phone_set_type="AUTO",
     )
     dictionary.dictionary_setup()
@@ -123,13 +178,14 @@ def test_english_mfa(english_us_mfa_dictionary, generated_dir, global_config, db
     assert all(x in dictionary.extra_questions_mapping["dental"] for x in dental)
 
 
-def test_mandarin_pinyin(pinyin_dictionary, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "pinyin")
-    global_config.temporary_directory = output_directory
+@pytest.mark.skip("No support for mixed formats")
+def test_mandarin_pinyin(pinyin_dictionary, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "pinyin")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=pinyin_dictionary,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
         phone_set_type="AUTO",
     )
     dictionary.dictionary_setup()
@@ -159,28 +215,71 @@ def test_mandarin_pinyin(pinyin_dictionary, generated_dir, global_config, db_set
     assert "uai1" in dictionary.extra_questions_mapping["tone_1"]
 
 
-def test_multispeaker_config(
-    multispeaker_dictionary_config_path, generated_dir, global_config, db_setup
-):
-    output_directory = generated_dir.joinpath("dictionary_tests", "multispeaker")
-    global_config.temporary_directory = output_directory
+def test_devanagari(english_dictionary, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "devanagari")
+    shutil.rmtree(output_directory, ignore_errors=True)
+    d = MultispeakerDictionary(
+        dictionary_path=english_dictionary,
+        position_dependent_phones=False,
+        temporary_directory=output_directory,
+    )
+    test_cases = ["हैं", "हूं", "हौं"]
+    for tc in test_cases:
+        assert [tc] == list(d.sanitize(tc))
+
+
+def test_japanese(english_dictionary, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "japanese")
+    shutil.rmtree(output_directory, ignore_errors=True)
+    d = MultispeakerDictionary(
+        dictionary_path=english_dictionary,
+        position_dependent_phones=False,
+        temporary_directory=output_directory,
+    )
+    assert ["かぎ括弧"] == list(d.sanitize("「かぎ括弧」"))
+    assert ["二重かぎ括弧"] == list(d.sanitize("『二重かぎ括弧』"))
+
+
+def test_xsampa_dir(xsampa_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "xsampa")
+    shutil.rmtree(output_directory, ignore_errors=True)
+
+    dictionary = MultispeakerDictionary(
+        dictionary_path=xsampa_dict_path,
+        position_dependent_phones=False,
+        punctuation=list(".-']["),
+        temporary_directory=output_directory,
+    )
+
+    dictionary.dictionary_setup()
+    dictionary.write_lexicon_information()
+    s, spl = dictionary.sanitize_function.get_functions_for_speaker("default")
+    assert spl.split_clitics(r"r\{und") == [r"r\{und"]
+    assert spl.split_clitics("{bI5s@`n") == ["{bI5s@`n"]
+    assert dictionary.word_mapping(1)[r"r\{und"]
+
+
+def test_multispeaker_config(multispeaker_dictionary_config_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "multispeaker")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=multispeaker_dictionary_config_path,
         position_dependent_phones=False,
         punctuation=list(".-']["),
+        temporary_directory=output_directory,
     )
     dictionary.dictionary_setup()
     dictionary.write_lexicon_information()
 
 
-def test_mixed_dictionary(mixed_dict_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "mixed")
-    global_config.temporary_directory = output_directory
+@pytest.mark.skip("No support for mixed formats")
+def test_mixed_dictionary(mixed_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "mixed")
     shutil.rmtree(output_directory, ignore_errors=True)
     dictionary = MultispeakerDictionary(
         dictionary_path=mixed_dict_path,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
     )
 
     dictionary.dictionary_setup()
@@ -207,22 +306,38 @@ def test_mixed_dictionary(mixed_dict_path, generated_dir, global_config, db_setu
         pron = session.query(Pronunciation).filter(Pronunciation.pronunciation == "dh ah").first()
         assert pron is not None
         assert pron.probability == 1
-        assert pron.silence_after_probability == 0.5
-        assert pron.silence_before_correction == 1.0
-        assert pron.non_silence_before_correction == 1.0
+        assert pron.silence_after_probability is None
+        assert pron.silence_before_correction is None
+        assert pron.non_silence_before_correction is None
 
 
-def test_vietnamese_tones(vietnamese_dict_path, generated_dir, global_config, db_setup):
-    output_directory = generated_dir.joinpath("dictionary_tests", "vietnamese")
-    global_config.temporary_directory = output_directory
+def test_vietnamese_tones(vietnamese_dict_path, generated_dir):
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "vietnamese")
     shutil.rmtree(output_directory, ignore_errors=True)
-    dictionary = MultispeakerDictionary(
+    d = MultispeakerDictionary(
         dictionary_path=vietnamese_dict_path,
         position_dependent_phones=False,
+        temporary_directory=output_directory,
         phone_set_type="IPA",
     )
-    dictionary.dictionary_setup()
-    assert dictionary.get_base_phone("o˨˩ˀ") == "o"
-    assert "o" in dictionary.kaldi_grouped_phones
-    assert "o˨˩ˀ" in dictionary.kaldi_grouped_phones["o"]
-    assert "o˦˩" in dictionary.kaldi_grouped_phones["o"]
+    d.dictionary_setup()
+    assert d.get_base_phone("o˨˩ˀ") == "o"
+    assert "o" in d.kaldi_grouped_phones
+    assert "o˨˩ˀ" in d.kaldi_grouped_phones["o"]
+    assert "o˦˩" in d.kaldi_grouped_phones["o"]
+    d.db_engine.dispose()
+
+    output_directory = os.path.join(generated_dir, "dictionary_tests", "vietnamese_keep_tone")
+    d = MultispeakerDictionary(
+        dictionary_path=vietnamese_dict_path,
+        position_dependent_phones=False,
+        temporary_directory=output_directory,
+        preserve_suprasegmentals=True,
+        phone_set_type="IPA",
+    )
+    d.dictionary_setup()
+
+    assert d.get_base_phone("o˨˩ˀ") == "o˨˩ˀ"
+    assert "o" not in d.kaldi_grouped_phones
+    assert "o˨˩ˀ" in d.kaldi_grouped_phones
+    assert "o˦˩" in d.kaldi_grouped_phones

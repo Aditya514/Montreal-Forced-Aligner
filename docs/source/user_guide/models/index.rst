@@ -18,10 +18,9 @@ for downloading these is :code:`mfa model download <model_type>` where ``model_t
 
    Please see the :xref:`mfa_models` site for information and statistics about various models.
 
-
 Command reference
 -----------------
 
-.. click:: montreal_forced_aligner.command_line.model:model_cli
-   :prog: mfa model
-   :nested: full
+.. autoprogram:: montreal_forced_aligner.command_line.mfa:create_parser()
+   :prog: mfa
+   :start_command: model

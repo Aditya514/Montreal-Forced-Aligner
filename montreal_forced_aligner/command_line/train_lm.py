@@ -2,91 +2,114 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
+from typing import TYPE_CHECKING, List, Optional
 
-import rich_click as click
-
-from montreal_forced_aligner.command_line.utils import common_options, validate_dictionary
-from montreal_forced_aligner.config import GLOBAL_CONFIG, MFA_PROFILE_VARIABLE
+from montreal_forced_aligner.command_line.utils import validate_model_arg
+from montreal_forced_aligner.exceptions import ArgumentError
 from montreal_forced_aligner.language_modeling.trainer import (
     MfaLmArpaTrainer,
     MfaLmCorpusTrainer,
     MfaLmDictionaryCorpusTrainer,
 )
 
-__all__ = ["train_lm_cli"]
+if TYPE_CHECKING:
+    from argparse import Namespace
+
+__all__ = ["train_lm", "validate_args", "run_train_lm"]
 
 
-@click.command(
-    name="train_lm",
-    context_settings=dict(
-        ignore_unknown_options=True,
-        allow_extra_args=True,
-        allow_interspersed_args=True,
-    ),
-    short_help="Train a language model",
-)
-@click.argument(
-    "source_path", type=click.Path(exists=True, file_okay=True, dir_okay=True, path_type=Path)
-)
-@click.argument(
-    "output_model_path", type=click.Path(file_okay=True, dir_okay=False, path_type=Path)
-)
-@click.option(
-    "--dictionary_path",
-    help="Full path to pronunciation dictionary, or saved dictionary name.",
-    type=click.UNPROCESSED,
-    callback=validate_dictionary,
-)
-@click.option(
-    "--config_path",
-    "-c",
-    help="Path to config file to use for training.",
-    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
-)
-@common_options
-@click.help_option("-h", "--help")
-@click.pass_context
-def train_lm_cli(context, **kwargs) -> None:
+def train_lm(args: Namespace, unknown_args: Optional[List[str]] = None) -> None:
     """
-    Train a language model from a corpus or convert an existing ARPA-format language model to an MFA language model.
-    """
-    if kwargs.get("profile", None) is not None:
-        os.environ[MFA_PROFILE_VARIABLE] = kwargs.pop("profile")
-    GLOBAL_CONFIG.current_profile.update(kwargs)
-    GLOBAL_CONFIG.save()
-    config_path = kwargs.get("config_path", None)
-    dictionary_path = kwargs.get("dictionary_path", None)
-    source_path = kwargs["source_path"]
-    output_model_path = kwargs["output_model_path"]
+    Run the language model training
 
-    if source_path.suffix.lower() != ".arpa":
-        if not dictionary_path:
+    Parameters
+    ----------
+    args: :class:`~argparse.Namespace`
+        Command line arguments
+    unknown_args: list[str]
+        Optional arguments that will be passed to configuration objects
+    """
+
+    if not args.source_path.lower().endswith(".arpa"):
+        if not args.dictionary_path:
             trainer = MfaLmCorpusTrainer(
-                corpus_directory=source_path,
-                **MfaLmCorpusTrainer.parse_parameters(config_path, context.params, context.args),
+                corpus_directory=args.source_path,
+                temporary_directory=args.temporary_directory,
+                **MfaLmCorpusTrainer.parse_parameters(args.config_path, args, unknown_args),
             )
         else:
             trainer = MfaLmDictionaryCorpusTrainer(
-                corpus_directory=source_path,
-                dictionary_path=dictionary_path,
+                corpus_directory=args.source_path,
+                dictionary_path=args.dictionary_path,
+                temporary_directory=args.temporary_directory,
                 **MfaLmDictionaryCorpusTrainer.parse_parameters(
-                    config_path, context.params, context.args
+                    args.config_path, args, unknown_args
                 ),
             )
     else:
         trainer = MfaLmArpaTrainer(
-            arpa_path=source_path,
-            **MfaLmArpaTrainer.parse_parameters(config_path, context.params, context.args),
+            arpa_path=args.source_path,
+            temporary_directory=args.temporary_directory,
+            **MfaLmArpaTrainer.parse_parameters(args.config_path, args, unknown_args),
         )
 
     try:
         trainer.setup()
         trainer.train()
-        trainer.export_model(output_model_path)
+        trainer.export_model(args.output_model_path)
 
     except Exception:
         trainer.dirty = True
         raise
     finally:
         trainer.cleanup()
+
+
+def validate_args(args: Namespace) -> None:
+    """
+    Validate the command line arguments
+
+    Parameters
+    ----------
+    args: :class:`~argparse.Namespace`
+        Parsed command line arguments
+
+    Raises
+    ------
+    :class:`~montreal_forced_aligner.exceptions.ArgumentError`
+        If there is a problem with any arguments
+    """
+    args.source_path = args.source_path.rstrip("/").rstrip("\\")
+    if args.dictionary_path:
+        args.dictionary_path = validate_model_arg(args.dictionary_path, "dictionary")
+    if not args.source_path.endswith(".arpa"):
+        if not os.path.exists(args.source_path):
+            raise (ArgumentError(f"Could not find the corpus directory {args.source_path}."))
+        if not os.path.isdir(args.source_path):
+            raise (
+                ArgumentError(
+                    f"The specified corpus directory ({args.source_path}) is not a directory."
+                )
+            )
+    else:
+        if not os.path.exists(args.source_path):
+            raise (ArgumentError(f"Could not find the source file {args.source_path}."))
+    if args.config_path and not os.path.exists(args.config_path):
+        raise (ArgumentError(f"Could not find the config file {args.config_path}."))
+    if args.model_path and not os.path.exists(args.model_path):
+        raise (ArgumentError(f"Could not find the model file {args.model_path}."))
+
+
+def run_train_lm(args: Namespace, unknown_args: Optional[List[str]] = None) -> None:
+    """
+    Wrapper function for running language model training
+
+    Parameters
+    ----------
+    args: :class:`~argparse.Namespace`
+        Parsed command line arguments
+    unknown_args: list[str]
+        Parsed command line arguments to be passed to the configuration objects
+    """
+    validate_args(args)
+    train_lm(args, unknown_args)
